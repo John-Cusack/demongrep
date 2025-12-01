@@ -77,7 +77,7 @@ choco install protoc
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/demongrep.git
+git clone https://github.com/yxanul/demongrep.git
 cd demongrep
 
 # Build release binary
