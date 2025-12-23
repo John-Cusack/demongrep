@@ -340,7 +340,7 @@ pub async fn search(
         println!("Try:");
         println!("  - Using different keywords");
         println!("  - Making your query more general");
-        println!("  - Running {} if the codebase changed", "demongrep index --force".bright_cyan());
+        println!("  - Running {} if the codebase changed", "demongrep index".bright_cyan());
         return Ok(());
     }
 

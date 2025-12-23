@@ -142,6 +142,35 @@ fn find_project_databases(project_name: &str) -> Result<Vec<PathBuf>> {
 }
 
 /// Remove a project from the projects.json mapping
+/// Remove entries from projects.json for deleted database paths
+fn cleanup_project_mappings(deleted_db_paths: &[PathBuf]) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let mapping_file = home.join(".demongrep").join("projects.json");
+    
+    if !mapping_file.exists() {
+        return Ok(());
+    }
+    
+    let content = std::fs::read_to_string(&mapping_file)?;
+    let mut mappings: std::collections::HashMap<String, String> = serde_json::from_str(&content)?;
+    
+    // Remove entries where the database path matches any deleted path
+    let original_len = mappings.len();
+    mappings.retain(|_project_path, db_path_str| {
+        let db_path = PathBuf::from(db_path_str.as_str());
+        // Keep entries that DON'T match any deleted path
+        !deleted_db_paths.iter().any(|deleted| deleted == &db_path)
+    });
+    
+    // Only write back if we actually removed something
+    if mappings.len() < original_len {
+        std::fs::write(&mapping_file, serde_json::to_string_pretty(&mappings)?)?;
+    }
+    
+    Ok(())
+}
+
+/// Remove project from mapping by name (legacy - used when --project flag is passed)
 fn remove_from_project_mapping(project_name: &str) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
     let mapping_file = home.join(".demongrep").join("projects.json");
@@ -171,9 +200,57 @@ fn remove_from_project_mapping(project_name: &str) -> Result<()> {
 }
 
 /// Index a repository
-pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bool, model: Option<ModelType>) -> Result<()> {
+pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: bool, model: Option<ModelType>) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
-    let db_path = get_index_db_path(path, global)?;
+    let canonical_path = project_path.canonicalize()?;
+    
+    // Check for existing databases (local and global)
+    let local_db_path = canonical_path.join(".demongrep.db");
+    let global_db_path = if let Some(home) = dirs::home_dir() {
+        let mut hasher = DefaultHasher::new();
+        canonical_path.hash(&mut hasher);
+        let hash = hasher.finish();
+        Some(home.join(".demongrep").join("stores").join(format!("{:x}", hash)))
+    } else {
+        None
+    };
+    
+    let local_exists = local_db_path.exists();
+    let global_exists = global_db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    
+    // Enforce exclusivity: can't have both local AND global
+    if local_exists && global_exists {
+        println!("\n{}", "⚠️  Both local and global databases exist!".yellow());
+        println!("   Local:  {}", local_db_path.display());
+        if let Some(ref gp) = global_db_path {
+            println!("   Global: {}", gp.display());
+        }
+        println!("\n{}", "Please run 'demongrep clear' first to choose which one to keep".bright_yellow());
+        return Err(anyhow::anyhow!("Cannot have both local and global databases"));
+    }
+    
+    // If user requests global but local exists, error
+    if global && local_exists {
+        println!("\n{}", "⚠️  Local database already exists!".yellow());
+        println!("   Local: {}", local_db_path.display());
+        println!("\n{}", "Cannot create global database when local exists.".yellow());
+        println!("   Run {} first to remove local database", "demongrep clear".bright_cyan());
+        return Err(anyhow::anyhow!("Local database already exists"));
+    }
+    
+    // If user requests local but global exists, error
+    if !global && global_exists {
+        println!("\n{}", "⚠️  Global database already exists!".yellow());
+        if let Some(ref gp) = global_db_path {
+            println!("   Global: {}", gp.display());
+        }
+        println!("\n{}", "Cannot create local database when global exists.".yellow());
+        println!("   • Use {} to update the global database, or", "demongrep index --global".bright_cyan());
+        println!("   • Run {} first to remove global database", "demongrep clear --global".bright_cyan());
+        return Err(anyhow::anyhow!("Global database already exists"));
+    }
+    
+    let db_path = get_index_db_path(Some(canonical_path.clone()), global)?;
     let model_type = model.unwrap_or_default();
 
     println!("{}", "🚀 Demongrep Indexer".bright_cyan().bold());
@@ -189,6 +266,15 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
 
     if dry_run {
         println!("\n{}", "🔍 DRY RUN MODE".bright_yellow());
+    }
+
+    // Check if this is incremental or full index
+    let is_incremental = db_path.exists();
+    
+    if is_incremental {
+        println!("🔄 Mode: Incremental (updating existing database)");
+    } else {
+        println!("🆕 Mode: Full (creating new database)");
     }
 
     // Phase 1: File Discovery
@@ -215,17 +301,64 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
         return Ok(());
     }
 
-    // Check if database exists and handle force flag
-    if db_path.exists() && !force {
-        println!("\n{}", "⚠️  Database already exists!".yellow());
-        println!("   Use --force to re-index");
-        return Ok(());
+    // Open or create database
+    let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
+    
+    // Check database metadata for model changes
+    if is_incremental {
+        let db_meta = store.get_db_metadata(model_type.name(), model_type.dimensions())?;
+        if db_meta.model_name != model_type.name() || db_meta.dimensions != model_type.dimensions() {
+            println!("\n{}", "⚠️  Model changed! Full re-index required.".yellow());
+            println!("   Old: {} ({} dims)", db_meta.model_name, db_meta.dimensions);
+            println!("   New: {} ({} dims)", model_type.name(), model_type.dimensions());
+            println!("\n   Run {} first", "demongrep clear".bright_cyan());
+            return Err(anyhow::anyhow!("Model mismatch - clear database first"));
+        }
     }
-
-    // Clear existing database if forcing
-    if db_path.exists() && force {
-        println!("\n{}", "🗑️  Clearing existing database...".yellow());
-        std::fs::remove_dir_all(&db_path)?;
+    
+    // Determine which files need indexing
+    let mut files_to_index = Vec::new();
+    let mut files_to_delete = Vec::new();
+    let mut unchanged_count = 0;
+    
+    if is_incremental {
+        println!("\n{}", "🔍 Checking for changes...".bright_cyan());
+        
+        // Check each discovered file
+        for file in &files {
+            match store.check_file_needs_reindex(&file.path) {
+                Ok((needs_reindex, old_chunk_ids)) => {
+                    if needs_reindex {
+                        files_to_index.push((file.clone(), old_chunk_ids));
+                    } else {
+                        unchanged_count += 1;
+                    }
+                }
+                Err(_) => {
+                    // Error checking file, index it
+                    files_to_index.push((file.clone(), vec![]));
+                }
+            }
+        }
+        
+        // Find deleted files
+        let deleted = store.find_deleted_files()?;
+        for (path, chunk_ids) in deleted {
+            files_to_delete.push((PathBuf::from(path), chunk_ids));
+        }
+        
+        println!("   📊 Status:");
+        println!("      Unchanged: {}", unchanged_count);
+        println!("      Changed/New: {}", files_to_index.len());
+        println!("      Deleted: {}", files_to_delete.len());
+        
+        if files_to_index.is_empty() && files_to_delete.is_empty() {
+            println!("\n{}", "✅ Database is up to date! No changes detected.".green());
+            return Ok(());
+        }
+    } else {
+        // Full index - all files need indexing
+        files_to_index = files.iter().map(|f| (f.clone(), vec![])).collect();
     }
 
     // Phase 2: Semantic Chunking
@@ -236,7 +369,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut all_chunks = Vec::new();
 
-    let pb = ProgressBar::new(files.len() as u64);
+    let pb = ProgressBar::new(files_to_index.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
@@ -245,7 +378,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     );
 
     let mut skipped_files = 0;
-    for file in &files {
+    for (file, _old_chunk_ids) in &files_to_index {
         pb.set_message(format!("{}", file.path.file_name().unwrap().to_string_lossy()));
 
         // Skip files that aren't valid UTF-8
@@ -273,11 +406,6 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
 
     println!("✅ Created {} chunks in {:?}", all_chunks.len(), chunking_duration);
 
-    if all_chunks.is_empty() {
-        println!("\n{}", "No chunks created!".yellow());
-        return Ok(());
-    }
-
     // Phase 3: Embedding Generation
     println!("\n{}", "Phase 3: Embedding Generation".bright_cyan());
     println!("{}", "-".repeat(60));
@@ -288,38 +416,91 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     let mut embedding_service = EmbeddingService::with_model(model_type)?;
     println!("✅ Model loaded: {} ({} dims)", embedding_service.model_name(), embedding_service.dimensions());
 
-    println!("\n🔄 Generating embeddings for {} chunks...", all_chunks.len());
-    let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
+    let embedded_chunks = if all_chunks.is_empty() {
+        vec![]
+    } else {
+        println!("\n🔄 Generating embeddings for {} chunks...", all_chunks.len());
+        let chunks = embedding_service.embed_chunks(all_chunks)?;
+        println!("✅ Generated {} embeddings in {:?}", chunks.len(), start.elapsed());
+        println!("   Average: {:?} per chunk", start.elapsed() / chunks.len() as u32);
+        
+        // Show cache stats
+        let cache_stats = embedding_service.cache_stats();
+        println!("   Cache hit rate: {:.1}%", cache_stats.hit_rate() * 100.0);
+        
+        chunks
+    };
     let embedding_duration = start.elapsed();
-
-    println!("✅ Generated {} embeddings in {:?}", embedded_chunks.len(), embedding_duration);
-    println!("   Average: {:?} per chunk", embedding_duration / embedded_chunks.len() as u32);
-
-    // Show cache stats
-    let cache_stats = embedding_service.cache_stats();
-    println!("   Cache hit rate: {:.1}%", cache_stats.hit_rate() * 100.0);
 
     // Phase 4: Vector Storage
     println!("\n{}", "Phase 4: Vector Storage".bright_cyan());
     println!("{}", "-".repeat(60));
 
     let start = Instant::now();
-    println!("🔄 Creating vector database...");
+    
+    // Database already opened earlier - just print status
+    if !is_incremental {
+        println!("✅ Database ready (newly created)");
+    }
 
-    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
-    println!("✅ Database created");
+    // Delete old chunks from changed/deleted files
+    if is_incremental {
+        let mut chunks_to_delete = Vec::new();
+        
+        // Collect chunks from changed files
+        for (_file, old_chunk_ids) in &files_to_index {
+            chunks_to_delete.extend(old_chunk_ids);
+        }
+        
+        // Collect chunks from deleted files
+        for (_path, old_chunk_ids) in &files_to_delete {
+            chunks_to_delete.extend(old_chunk_ids);
+        }
+        
+        if !chunks_to_delete.is_empty() {
+            println!("\n🗑️  Deleting {} old chunks...", chunks_to_delete.len());
+            store.delete_chunks(&chunks_to_delete)?;
+            println!("✅ Old chunks deleted");
+        }
+    }
 
-    println!("\n🔄 Inserting {} chunks...", embedded_chunks.len());
-    let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-    println!("✅ Inserted {} chunks into vector store", chunk_ids.len());
+    // Insert new chunks
+    let chunk_ids = if !embedded_chunks.is_empty() {
+        println!("\n🔄 Inserting {} chunks...", embedded_chunks.len());
+        let ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
+        println!("✅ Inserted {} chunks into vector store", ids.len());
+        ids
+    } else {
+        vec![]
+    };
 
     println!("\n🔄 Building vector index...");
     store.build_index()?;
 
     // Phase 4b: FTS Index
-    println!("\n🔄 Building full-text search index...");
+    println!("\n🔄 Updating full-text search index...");
     let mut fts_store = FtsStore::new(&db_path)?;
 
+    // Delete old FTS entries
+    if is_incremental {
+        let mut fts_chunks_to_delete: Vec<u32> = Vec::new();
+        for (_file, old_chunk_ids) in &files_to_index {
+            fts_chunks_to_delete.extend(old_chunk_ids);
+        }
+        for (_path, old_chunk_ids) in &files_to_delete {
+            fts_chunks_to_delete.extend(old_chunk_ids);
+        }
+        
+        if !fts_chunks_to_delete.is_empty() {
+            for chunk_id in fts_chunks_to_delete {
+                let _ = fts_store.delete_chunk(chunk_id);
+            }
+            // Commit deletions before adding new entries
+            fts_store.commit()?;
+        }
+    }
+
+    // Add new FTS entries
     for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
         fts_store.add_chunk(
             *chunk_id,
@@ -333,13 +514,45 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     fts_store.commit()?;
 
     let fts_stats = fts_store.stats()?;
-    println!("✅ FTS index built ({} documents)", fts_stats.num_documents);
+    println!("✅ FTS index updated ({} documents)", fts_stats.num_documents);
 
     let storage_duration = start.elapsed();
 
-    println!("✅ Index built in {:?}", storage_duration);
+    println!("✅ Index updated in {:?}", storage_duration);
+    
+    // Update file metadata in VectorStore
+    println!("\n🔄 Updating file metadata...");
+    
+    // Group chunks by file
+    use std::collections::HashMap;
+    let mut file_chunks: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+    
+    for (i, chunk) in embedded_chunks.iter().enumerate() {
+        let path = PathBuf::from(&chunk.chunk.path);
+        file_chunks.entry(path).or_insert_with(Vec::new).push(chunk_ids[i]);
+    }
+    
+    // Update metadata for changed files
+    for (file, _) in &files_to_index {
+        let chunk_ids_for_file = file_chunks.get(&file.path).cloned().unwrap_or_default();
+        store.update_file_metadata(&file.path, chunk_ids_for_file)?;
+    }
+    
+    // Remove metadata for deleted files
+    for (path, _) in &files_to_delete {
+        store.remove_file_metadata(&path)?;
+    }
+    
+    // Save database metadata
+    store.save_db_metadata(
+        embedding_service.model_name(),
+        embedding_service.dimensions(),
+        !is_incremental // mark_full_index only on first index
+    )?;
+    
+    println!("✅ File metadata saved");
 
-    // Save model metadata
+    // Save model metadata (for backwards compatibility with tools that read metadata.json)
     let metadata = serde_json::json!({
         "model_short_name": embedding_service.model_short_name(),
         "model_name": embedding_service.model_name(),
@@ -533,17 +746,34 @@ pub async fn clear(path: Option<PathBuf>, yes: bool, project: Option<String>) ->
         }
     }
 
+    // Track which paths we're deleting for cleanup
+    let mut deleted_global_dbs = Vec::new();
+    
     for db_path in db_paths {
         let db_type = if db_path.ends_with(".demongrep.db") { "Local" } else { "Global" };
         println!("\n🔄 Removing {} database...", db_type);
+        
+        // Track global databases for projects.json cleanup
+        if !db_path.ends_with(".demongrep.db") {
+            deleted_global_dbs.push(db_path.clone());
+        }
+        
         std::fs::remove_dir_all(&db_path)?;
         println!("{}", format!("✅ {} database cleared!", db_type).green());
     }
 
-    // If we cleared by project name, remove from projects.json
-    if let Some(project_name) = project {
-        remove_from_project_mapping(&project_name)?;
-        println!("\n✅ Removed '{}' from global registry", project_name);
+    // Clean up projects.json for any deleted global databases
+    if !deleted_global_dbs.is_empty() {
+        if let Err(e) = cleanup_project_mappings(&deleted_global_dbs) {
+            eprintln!("{}", format!("⚠️  Warning: Could not clean up projects.json: {}", e).yellow());
+        } else {
+            println!("\n✅ Cleaned up global registry");
+        }
+    }
+    
+    // If we cleared by project name, also show a message
+    if project.is_some() {
+        // Already cleaned up above
     }
 
     Ok(())

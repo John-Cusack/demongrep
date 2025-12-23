@@ -100,11 +100,28 @@ impl ServerState {
             }
         }
         
-        // Sort by score and limit
-        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        all_results.truncate(limit);
+        // Deduplicate results by (path, start_line, end_line) and keep highest score
+        let mut seen: std::collections::HashMap<(String, usize, usize), usize> = std::collections::HashMap::new();
+        let mut deduped_results: Vec<crate::vectordb::SearchResult> = Vec::new();
         
-        Ok(all_results)
+        for result in all_results {
+            let key = (result.path.clone(), result.start_line, result.end_line);
+            if let Some(&idx) = seen.get(&key) {
+                // Already have this result, keep the one with higher score
+                if result.score > deduped_results[idx].score {
+                    deduped_results[idx] = result;
+                }
+            } else {
+                seen.insert(key, deduped_results.len());
+                deduped_results.push(result);
+            }
+        }
+        
+        // Sort by score and limit
+        deduped_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        deduped_results.truncate(limit);
+        
+        Ok(deduped_results)
     }
     
     /// Get combined statistics
@@ -274,7 +291,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
     println!("   Model: {} ({} dims)", model_type.name(), dimensions);
 
     // Load local database (if exists)
-    let (local_store, file_meta) = if let Some(ref local_path) = local_db_path {
+    let (local_store, local_file_meta) = if let Some(ref local_path) = local_db_path {
         let file_meta = FileMetaStore::load_or_create(local_path, model_type.short_name(), dimensions)?;
         let store = VectorStore::new(local_path, dimensions)?;
         let stats = store.stats()?;
@@ -295,34 +312,75 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
         (None, None)
     };
 
-    // Load global database (if exists) - read-only
-    let global_store = if let Some(ref global_path) = global_db_path {
+    // Load global database (if exists)
+    // If local exists, global is read-only for search
+    // If local doesn't exist, global can be written to (for file watching)
+    let (global_store, global_file_meta) = if let Some(ref global_path) = global_db_path {
         match VectorStore::new(global_path, dimensions) {
             Ok(store) => {
                 let stats = store.stats()?;
-                println!("   ✅ Global: {} chunks from {} files", stats.total_chunks, stats.total_files);
-                Some(store)
+                
+                // If no local database, we can watch and update the global one
+                if local_db_path.is_none() {
+                    let file_meta = FileMetaStore::load_or_create(global_path, model_type.short_name(), dimensions)?;
+                    
+                    if stats.total_chunks == 0 {
+                        println!("\n{}", "📦 Global database empty, performing initial index...".yellow());
+                        let (store, file_meta) = initial_index(
+                            root.clone(),
+                            global_path.clone(),
+                            model_type,
+                        ).await?;
+                        (Some(store), Some(file_meta))
+                    } else {
+                        println!("   ✅ Global: {} chunks from {} files (writable)", stats.total_chunks, stats.total_files);
+                        (Some(store), Some(file_meta))
+                    }
+                } else {
+                    // Local exists, global is read-only
+                    println!("   ✅ Global: {} chunks from {} files (read-only)", stats.total_chunks, stats.total_files);
+                    (Some(store), None)
+                }
             }
             Err(e) => {
                 eprintln!("   ⚠️  Could not load global database: {}", e);
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
-
-    // Build server state
-    let state = Arc::new(ServerState {
-        local_store: local_store.map(RwLock::new),
-        local_db_path,
-        global_store: global_store.map(RwLock::new),
-        global_db_path,
-        embedding_service: Mutex::new(embedding_service),
-        chunker: Mutex::new(SemanticChunker::new(100, 2000, 10)),
-        file_meta: file_meta.map(RwLock::new),
-        root: root.clone(),
-    });
+    
+    // Determine which database to use for file watching and how to set up the state
+    // Priority: local > global
+    let state = if local_store.is_some() {
+        // We have a local database - use it as primary, global as secondary (read-only)
+        Arc::new(ServerState {
+            local_store: local_store.map(RwLock::new),
+            local_db_path: local_db_path.clone(),
+            global_store: global_store.map(RwLock::new),
+            global_db_path,
+            embedding_service: Mutex::new(embedding_service),
+            chunker: Mutex::new(SemanticChunker::new(100, 2000, 10)),
+            file_meta: local_file_meta.map(RwLock::new),
+            root: root.clone(),
+        })
+    } else if global_store.is_some() {
+        // Only global database exists - use it as primary (writable)
+        Arc::new(ServerState {
+            local_store: global_store.map(RwLock::new),
+            local_db_path: global_db_path,
+            global_store: None,
+            global_db_path: None,
+            embedding_service: Mutex::new(embedding_service),
+            chunker: Mutex::new(SemanticChunker::new(100, 2000, 10)),
+            file_meta: global_file_meta.map(RwLock::new),
+            root: root.clone(),
+        })
+    } else {
+        // No databases - shouldn't happen because we checked earlier
+        return Err(anyhow!("No databases available"));
+    };
 
     start_server(state, port, root).await
 }
@@ -395,11 +453,11 @@ async fn initial_index(
 }
 
 async fn start_server(state: Arc<ServerState>, port: u16, root: PathBuf) -> Result<()> {
-    // Check if we have a local database BEFORE building router
-    let has_local_store = state.local_store.is_some();
+    // Check if we have a writable database (local_store contains the primary/writable database)
+    let has_writable_store = state.local_store.is_some() && state.file_meta.is_some();
     
-    // Start file watcher in background (only if we have a local database)
-    if has_local_store {
+    // Start file watcher in background (if we have a writable database)
+    if has_writable_store {
         let watcher_state = state.clone();
         let watcher_root = root.clone();
         tokio::spawn(async move {
@@ -408,7 +466,7 @@ async fn start_server(state: Arc<ServerState>, port: u16, root: PathBuf) -> Resu
             }
         });
     } else {
-        println!("\n{}", "ℹ️  No local database - file watching disabled".dimmed());
+        println!("\n{}", "ℹ️  No writable database - file watching disabled".dimmed());
     }
 
     // Build HTTP router
@@ -422,8 +480,8 @@ async fn start_server(state: Arc<ServerState>, port: u16, root: PathBuf) -> Resu
     println!("\n{}", "🌐 Server ready!".bright_green().bold());
     println!("  Health: http://{}/health", addr);
     println!("  Search: POST http://{}/search", addr);
-    if has_local_store {
-        println!("\n{}", "👀 Watching for file changes in local database...".dimmed());
+    if has_writable_store {
+        println!("\n{}", "👀 Watching for file changes...".dimmed());
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -437,9 +495,12 @@ async fn run_file_watcher(state: Arc<ServerState>, root: PathBuf) -> Result<()> 
     watcher.start(300)?; // 300ms debounce
 
     loop {
-        let events = watcher.wait_for_events(Duration::from_secs(1));
+        // Poll for events (non-blocking)
+        let events = watcher.poll_events();
 
         if events.is_empty() {
+            // No events - sleep to avoid busy-waiting and allow other tasks to run
+            tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
@@ -448,16 +509,28 @@ async fn run_file_watcher(state: Arc<ServerState>, root: PathBuf) -> Result<()> 
         for event in events {
             match event {
                 FileEvent::Modified(path) => {
+                    // Skip directories
+                    if path.is_dir() {
+                        continue;
+                    }
                     if let Err(e) = handle_file_modified(&state, &path).await {
                         eprintln!("  ❌ Error processing {}: {}", path.display(), e);
                     }
                 }
                 FileEvent::Deleted(path) => {
+                    // Skip directories
+                    if path.is_dir() {
+                        continue;
+                    }
                     if let Err(e) = handle_file_deleted(&state, &path).await {
                         eprintln!("  ❌ Error processing deletion {}: {}", path.display(), e);
                     }
                 }
                 FileEvent::Renamed(from, to) => {
+                    // Skip directories
+                    if from.is_dir() || to.is_dir() {
+                        continue;
+                    }
                     // Treat as delete + create
                     let _ = handle_file_deleted(&state, &from).await;
                     let _ = handle_file_modified(&state, &to).await;
@@ -484,6 +557,11 @@ async fn run_file_watcher(state: Arc<ServerState>, root: PathBuf) -> Result<()> 
 }
 
 async fn handle_file_modified(state: &ServerState, path: &PathBuf) -> Result<()> {
+    // Skip if path is a directory
+    if path.is_dir() {
+        return Ok(());
+    }
+    
     // Only handle files in local database
     let file_meta = state.file_meta.as_ref()
         .ok_or_else(|| anyhow!("No local database available"))?;
@@ -545,6 +623,11 @@ async fn handle_file_modified(state: &ServerState, path: &PathBuf) -> Result<()>
 }
 
 async fn handle_file_deleted(state: &ServerState, path: &PathBuf) -> Result<()> {
+    // Skip if path is a directory
+    if path.is_dir() {
+        return Ok(());
+    }
+    
     // Only handle files in local database
     let file_meta = state.file_meta.as_ref()
         .ok_or_else(|| anyhow!("No local database available"))?;

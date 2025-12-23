@@ -101,8 +101,8 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Force full re-index
-        #[arg(short, long)]
+        /// [DEPRECATED] No longer needed - index is always incremental
+        #[arg(short, long, hide = true)]
         force: bool,
 
         /// Index to global database in home directory instead of local .demongrep.db

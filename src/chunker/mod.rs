@@ -11,6 +11,8 @@ mod extractor;
 mod semantic;
 
 pub use semantic::SemanticChunker;
+pub use parser::{CodeParser, ParsedCode};
+pub use grammar::{GrammarManager, GrammarStats};
 
 /// Default number of context lines before/after a chunk
 pub const DEFAULT_CONTEXT_LINES: usize = 3;
