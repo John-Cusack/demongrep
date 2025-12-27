@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,36 +25,71 @@ pub enum FileEvent {
 /// 1. Native Rust implementation (faster than Node.js chokidar)
 /// 2. Built-in debouncing (configurable)
 /// 3. Batched events for efficient processing
+/// 4. Respects .gitignore, .demongrepignore, and .osgrepignore
 pub struct FileWatcher {
     root: PathBuf,
     debouncer: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
     receiver: Option<Receiver<DebounceEventResult>>,
-    ignore_patterns: Vec<String>,
+    gitignore: Option<Gitignore>,
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
+        // Build gitignore matcher
+        let gitignore = Self::build_gitignore(&root);
+        
         Self {
             root,
             debouncer: None,
             receiver: None,
-            ignore_patterns: vec![
-                ".git".to_string(),
-                ".demongrep.db".to_string(),
-                "node_modules".to_string(),
-                "target".to_string(),
-                ".venv".to_string(),
-                "__pycache__".to_string(),
-                "*.lock".to_string(),
-                "*.pyc".to_string(),
-            ],
+            gitignore,
         }
     }
 
-    /// Add patterns to ignore
-    pub fn with_ignore_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.ignore_patterns.extend(patterns);
+    /// Build gitignore matcher from .gitignore, .demongrepignore, and .osgrepignore
+    fn build_gitignore(root: &Path) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(root);
+        
+        // Add .gitignore
+        let gitignore_path = root.join(".gitignore");
+        if gitignore_path.exists() {
+            let _ = builder.add(gitignore_path);
+        }
+        
+        // Add .demongrepignore
+        let demongrepignore_path = root.join(".demongrepignore");
+        if demongrepignore_path.exists() {
+            let _ = builder.add(demongrepignore_path);
+        }
+        
+        // Add .osgrepignore (for compatibility)
+        let osgrepignore_path = root.join(".osgrepignore");
+        if osgrepignore_path.exists() {
+            let _ = builder.add(osgrepignore_path);
+        }
+        
+        // Add common ignore patterns
+        let _ = builder.add_line(None, ".git");
+        let _ = builder.add_line(None, ".demongrep.db");
+        let _ = builder.add_line(None, "node_modules");
+        let _ = builder.add_line(None, "target");
+        let _ = builder.add_line(None, ".venv");
+        let _ = builder.add_line(None, "__pycache__");
+        let _ = builder.add_line(None, "*.dll");
+        let _ = builder.add_line(None, "*.exe");
+        let _ = builder.add_line(None, "*.so");
+        let _ = builder.add_line(None, "*.dylib");
+        let _ = builder.add_line(None, "*.pdb");
+        let _ = builder.add_line(None, "*.lock");
+        let _ = builder.add_line(None, "*.pyc");
+        
+        builder.build().ok()
+    }
+
+    /// Add custom ignore patterns (deprecated - use .demongrepignore instead)
+    #[deprecated(note = "Use .demongrepignore file instead")]
+    pub fn with_ignore_patterns(self, _patterns: Vec<String>) -> Self {
         self
     }
 
@@ -93,31 +129,52 @@ impl FileWatcher {
 
     /// Check if a path should be ignored
     fn should_ignore(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-
-        for pattern in &self.ignore_patterns {
-            if pattern.starts_with('*') {
-                // Extension pattern like "*.lock"
-                let ext = &pattern[1..];
-                if path_str.ends_with(ext) {
-                    return true;
-                }
+        // Use gitignore matcher if available
+        if let Some(ref gitignore) = self.gitignore {
+            // Make path relative to root for gitignore matching
+            let relative_path = if path.starts_with(&self.root) {
+                path.strip_prefix(&self.root).unwrap_or(path)
             } else {
-                // Directory/file name pattern
-                if path_str.contains(pattern) {
-                    return true;
+                path
+            };
+            
+            // Check if path itself is ignored
+            let is_dir = path.is_dir();
+            match gitignore.matched(relative_path, is_dir) {
+                ignore::Match::Ignore(_) => return true,
+                ignore::Match::Whitelist(_) => return false,
+                ignore::Match::None => {},
+            }
+            
+            // Also check if any parent directory is ignored
+            // This handles cases like .git/config where the file is inside an ignored directory
+            let mut current = relative_path;
+            while let Some(parent) = current.parent() {
+                if !parent.as_os_str().is_empty() {
+                    match gitignore.matched(parent, true) {
+                        ignore::Match::Ignore(_) => return true,
+                        ignore::Match::Whitelist(_) => return false,
+                        ignore::Match::None => {},
+                    }
                 }
+                current = parent;
             }
         }
-
-        // Ignore hidden files (except .gitignore, etc)
-        if let Some(name) = path.file_name() {
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') && name_str != ".gitignore" {
+        
+        // Additional check: skip if file is binary (common binary extensions not in gitignore)
+        if let Some(ext) = path.extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            if matches!(ext_str.as_str(), 
+                "dll" | "exe" | "so" | "dylib" | "bin" | "pdb" | 
+                "obj" | "o" | "a" | "lib" | "class" | "jar" | 
+                "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" |
+                "png" | "jpg" | "jpeg" | "gif" | "ico" | "svg" |
+                "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            ) {
                 return true;
             }
         }
-
+        
         false
     }
 
@@ -253,15 +310,23 @@ mod tests {
 
     #[test]
     fn test_should_ignore() {
-        let watcher = FileWatcher::new(PathBuf::from("/tmp"));
+        let dir = tempdir().unwrap();
+        let watcher = FileWatcher::new(dir.path().to_path_buf());
 
-        assert!(watcher.should_ignore(Path::new("/tmp/.git/config")));
-        assert!(watcher.should_ignore(Path::new("/tmp/node_modules/foo")));
-        assert!(watcher.should_ignore(Path::new("/tmp/Cargo.lock")));
-        assert!(watcher.should_ignore(Path::new("/tmp/.hidden_file")));
+        // Create some test paths
+        let git_path = dir.path().join(".git/config");
+        let node_modules_path = dir.path().join("node_modules/foo");
+        let dll_path = dir.path().join("test.dll");
+        let exe_path = dir.path().join("test.exe");
+        let lock_path = dir.path().join("Cargo.lock");
+        let rs_path = dir.path().join("src/main.rs");
 
-        assert!(!watcher.should_ignore(Path::new("/tmp/src/main.rs")));
-        assert!(!watcher.should_ignore(Path::new("/tmp/.gitignore")));
+        assert!(watcher.should_ignore(&git_path));
+        assert!(watcher.should_ignore(&node_modules_path));
+        assert!(watcher.should_ignore(&dll_path));
+        assert!(watcher.should_ignore(&exe_path));
+        assert!(watcher.should_ignore(&lock_path));
+        assert!(!watcher.should_ignore(&rs_path));
     }
 
     #[test]

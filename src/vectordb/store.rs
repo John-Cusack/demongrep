@@ -9,8 +9,10 @@ use heed::{Database, EnvOpenOptions};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Chunk metadata stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,34 @@ pub struct ChunkMetadata {
     /// Lines of code immediately after this chunk (for context)
     #[serde(default)]
     pub context_next: Option<String>,
+}
+
+/// File metadata for incremental indexing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMeta {
+    /// SHA256 hash of file content
+    pub hash: String,
+    /// File modification time (for quick change detection)
+    pub mtime: u64,
+    /// File size in bytes
+    pub size: u64,
+    /// Number of chunks extracted from this file
+    pub chunk_count: usize,
+    /// Chunk IDs in the vector store (for deletion on update)
+    pub chunk_ids: Vec<u32>,
+}
+
+/// Database metadata for model tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbMetadata {
+    /// Model name used for embeddings
+    pub model_name: String,
+    /// Embedding dimensions
+    pub dimensions: usize,
+    /// Last full index timestamp
+    pub last_full_index: Option<u64>,
+    /// Version for format compatibility
+    pub version: u32,
 }
 
 impl ChunkMetadata {
@@ -59,12 +89,15 @@ impl ChunkMetadata {
 /// Single-file database with:
 /// - Vector search via arroy (ANN with random projections)
 /// - Metadata storage via heed (LMDB)
+/// - File metadata for incremental indexing
 /// - ACID transactions
 /// - Memory-mapped for performance
 pub struct VectorStore {
     env: heed::Env,
     vectors: ArroyDatabase<Cosine>,
     chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    file_metadata: Database<Str, SerdeBincode<FileMeta>>,
+    db_metadata: Database<Str, SerdeBincode<DbMetadata>>,
     next_id: u32,
     dimensions: usize,
     indexed: bool,
@@ -96,6 +129,10 @@ impl VectorStore {
         let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
             env.create_database(&mut wtxn, Some("chunks"))?;
+        let file_metadata: Database<Str, SerdeBincode<FileMeta>> =
+            env.create_database(&mut wtxn, Some("file_metadata"))?;
+        let db_metadata: Database<Str, SerdeBincode<DbMetadata>> =
+            env.create_database(&mut wtxn, Some("db_metadata"))?;
 
         // Get the next ID by counting existing chunks
         let next_id = chunks.len(&wtxn)? as u32;
@@ -116,6 +153,8 @@ impl VectorStore {
             env,
             vectors,
             chunks,
+            file_metadata,
+            db_metadata,
             next_id,
             dimensions,
             indexed,
@@ -377,9 +416,11 @@ impl VectorStore {
 
         let mut wtxn = self.env.write_txn()?;
 
-        // Clear both databases
+        // Clear all databases
         self.chunks.clear(&mut wtxn)?;
         self.vectors.clear(&mut wtxn)?;
+        self.file_metadata.clear(&mut wtxn)?;
+        self.db_metadata.clear(&mut wtxn)?;
 
         wtxn.commit()?;
 
@@ -461,6 +502,179 @@ pub struct StoreStats {
     pub total_files: usize,
     pub indexed: bool,
     pub dimensions: usize,
+}
+
+impl VectorStore {
+    // ========== File Metadata Methods for Incremental Indexing ==========
+    
+    /// Compute SHA256 hash of file content
+    fn compute_file_hash(path: &Path) -> Result<String> {
+        let content = std::fs::read(path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Get file modification time as unix timestamp
+    fn get_file_mtime(path: &Path) -> Result<u64> {
+        let metadata = std::fs::metadata(path)?;
+        let mtime = metadata.modified()?;
+        Ok(mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs())
+    }
+
+    /// Check if a file needs re-indexing
+    /// Returns: (needs_reindex, existing_chunk_ids_to_delete)
+    pub fn check_file_needs_reindex(&self, path: &Path) -> Result<(bool, Vec<u32>)> {
+        let path_str = path.to_string_lossy().to_string();
+        
+        // Get current file stats
+        let current_mtime = Self::get_file_mtime(path)?;
+        let current_size = std::fs::metadata(path)?.len();
+
+        let rtxn = self.env.read_txn()?;
+        
+        if let Some(meta) = self.file_metadata.get(&rtxn, &path_str)? {
+            // Quick check: if mtime and size unchanged, file is unchanged
+            if meta.mtime == current_mtime && meta.size == current_size {
+                return Ok((false, vec![]));
+            }
+
+            // Mtime changed - compute hash to be sure
+            let current_hash = Self::compute_file_hash(path)?;
+            if meta.hash == current_hash {
+                // Content same, just mtime changed (e.g., touch)
+                return Ok((false, vec![]));
+            }
+
+            // File changed - return old chunk IDs for deletion
+            Ok((true, meta.chunk_ids.clone()))
+        } else {
+            // New file
+            Ok((true, vec![]))
+        }
+    }
+
+    /// Update metadata for a file after indexing
+    pub fn update_file_metadata(&mut self, path: &Path, chunk_ids: Vec<u32>) -> Result<()> {
+        let path_str = path.to_string_lossy().to_string();
+        let hash = Self::compute_file_hash(path)?;
+        let mtime = Self::get_file_mtime(path)?;
+        let size = std::fs::metadata(path)?.len();
+
+        let meta = FileMeta {
+            hash,
+            mtime,
+            size,
+            chunk_count: chunk_ids.len(),
+            chunk_ids,
+        };
+
+        let mut wtxn = self.env.write_txn()?;
+        self.file_metadata.put(&mut wtxn, &path_str, &meta)?;
+        wtxn.commit()?;
+
+        Ok(())
+    }
+
+    /// Remove metadata for a deleted file
+    /// Returns the chunk IDs that were associated with the file
+    pub fn remove_file_metadata(&mut self, path: &Path) -> Result<Option<Vec<u32>>> {
+        let path_str = path.to_string_lossy().to_string();
+        
+        let mut wtxn = self.env.write_txn()?;
+        let chunk_ids = self.file_metadata.get(&wtxn, &path_str)?
+            .map(|meta| meta.chunk_ids.clone());
+        
+        self.file_metadata.delete(&mut wtxn, &path_str)?;
+        wtxn.commit()?;
+
+        Ok(chunk_ids)
+    }
+
+    /// Find files that were deleted (exist in metadata but not on disk)
+    pub fn find_deleted_files(&self) -> Result<Vec<(String, Vec<u32>)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut deleted = Vec::new();
+
+        for item in self.file_metadata.iter(&rtxn)? {
+            let (path_str, meta) = item?;
+            let path = PathBuf::from(path_str);
+            if !path.exists() {
+                deleted.push((path_str.to_string(), meta.chunk_ids.clone()));
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get or initialize database metadata
+    pub fn get_db_metadata(&self, model_name: &str, dimensions: usize) -> Result<DbMetadata> {
+        let rtxn = self.env.read_txn()?;
+        
+        if let Some(meta) = self.db_metadata.get(&rtxn, "metadata")? {
+            // Check if model changed
+            if meta.model_name != model_name || meta.dimensions != dimensions {
+                // Model changed - return new metadata (caller should handle re-index)
+                Ok(DbMetadata {
+                    model_name: model_name.to_string(),
+                    dimensions,
+                    last_full_index: None,
+                    version: 1,
+                })
+            } else {
+                Ok(meta)
+            }
+        } else {
+            // New database
+            Ok(DbMetadata {
+                model_name: model_name.to_string(),
+                dimensions,
+                last_full_index: None,
+                version: 1,
+            })
+        }
+    }
+
+    /// Save database metadata
+    pub fn save_db_metadata(&mut self, model_name: &str, dimensions: usize, mark_full_index: bool) -> Result<()> {
+        let mut meta = DbMetadata {
+            model_name: model_name.to_string(),
+            dimensions,
+            last_full_index: None,
+            version: 1,
+        };
+
+        if mark_full_index {
+            meta.last_full_index = Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs()
+            );
+        }
+
+        let mut wtxn = self.env.write_txn()?;
+        self.db_metadata.put(&mut wtxn, "metadata", &meta)?;
+        wtxn.commit()?;
+
+        Ok(())
+    }
+
+    /// Get file metadata statistics
+    pub fn file_metadata_stats(&self) -> Result<(usize, usize, u64)> {
+        let rtxn = self.env.read_txn()?;
+        let mut total_files = 0;
+        let mut total_chunks = 0;
+        let mut total_size = 0u64;
+
+        for item in self.file_metadata.iter(&rtxn)? {
+            let (_path, meta) = item?;
+            total_files += 1;
+            total_chunks += meta.chunk_count;
+            total_size += meta.size;
+        }
+
+        Ok((total_files, total_chunks, total_size))
+    }
 }
 
 #[cfg(test)]

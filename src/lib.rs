@@ -1,3 +1,6 @@
+// Allow dead code - this is a library with public APIs for future use
+#![allow(dead_code)]
+
 pub mod config;
 pub mod chunker;
 pub mod embed;
@@ -13,6 +16,7 @@ pub mod file;
 pub mod fts;
 pub mod mcp;
 pub mod output;
+pub mod database;  // NEW: Add database module
 
 // Re-export commonly used types
 pub use config::Config;
@@ -21,3 +25,4 @@ pub use chunker::{Chunk, ChunkKind, Chunker};
 pub use embed::{EmbeddingService, EmbeddedChunk, ModelType, CacheStats};
 pub use vectordb::{VectorStore, SearchResult, StoreStats};
 pub use fts::{FtsStore, FtsResult};
+pub use database::{DatabaseManager, Database, DatabaseType, CombinedStats};  // NEW: Re-export database types
