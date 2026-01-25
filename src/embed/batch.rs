@@ -1,7 +1,13 @@
-use super::embedder::FastEmbedder;
+use super::embedder::{ExecutionProviderType, FastEmbedder};
 use crate::chunker::Chunk;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
+
+/// Base token budgets for 384-dim models (scales inversely with model size)
+/// These are in "estimated tokens" (chars / 4)
+const GPU_BASE_TOKEN_BUDGET: usize = 100_000;  // ~400KB of text per batch for 384-dim
+const CPU_BASE_TOKEN_BUDGET: usize = 50_000;   // ~200KB of text per batch for 384-dim
+const REFERENCE_DIMS: usize = 384;             // Base model dimensions for budget calculation
 
 /// Statistics for embedding operations
 #[derive(Debug, Clone, Default)]
@@ -67,68 +73,157 @@ impl EmbeddedChunk {
 /// Batch processor for embedding chunks efficiently
 pub struct BatchEmbedder {
     pub embedder: Arc<Mutex<FastEmbedder>>,
-    batch_size: usize,
+    token_budget: usize,
+    provider: ExecutionProviderType,
+    model_dims: usize,
 }
 
 impl BatchEmbedder {
-    /// Create a new batch embedder
+    /// Create a new batch embedder with automatic token budget based on provider and model
     pub fn new(embedder: Arc<Mutex<FastEmbedder>>) -> Self {
+        let (provider, model_dims) = {
+            let e = embedder.lock().unwrap();
+            (e.provider(), e.dimensions())
+        };
+        let token_budget = Self::calculate_token_budget(&provider, model_dims);
         Self {
             embedder,
-            batch_size: 32, // Default batch size
+            token_budget,
+            provider,
+            model_dims,
         }
     }
 
-    /// Create with custom batch size
+    /// Create with custom batch size (converted to token budget)
+    /// For backwards compatibility - batch_size is converted to approximate token budget
     pub fn with_batch_size(embedder: Arc<Mutex<FastEmbedder>>, batch_size: usize) -> Self {
+        let (provider, model_dims) = {
+            let e = embedder.lock().unwrap();
+            (e.provider(), e.dimensions())
+        };
+        // Convert batch_size to token budget: assume average 500 chars per chunk
+        // So batch_size=32 → 32 * 500 / 4 = 4000 tokens
+        let token_budget = batch_size * 125; // 500 chars / 4 chars per token
         Self {
             embedder,
-            batch_size,
+            token_budget: token_budget.max(1000), // Minimum 1000 tokens
+            provider,
+            model_dims,
         }
     }
 
-    /// Embed a batch of chunks
+    /// Create with explicit token budget
+    pub fn with_token_budget(embedder: Arc<Mutex<FastEmbedder>>, token_budget: usize) -> Self {
+        let (provider, model_dims) = {
+            let e = embedder.lock().unwrap();
+            (e.provider(), e.dimensions())
+        };
+        Self {
+            embedder,
+            token_budget,
+            provider,
+            model_dims,
+        }
+    }
+
+    /// Calculate token budget based on provider and model dimensions
+    ///
+    /// Larger models (more dimensions) use more memory per token,
+    /// so we scale the budget inversely with model size.
+    fn calculate_token_budget(provider: &ExecutionProviderType, model_dims: usize) -> usize {
+        let base_budget = match provider {
+            ExecutionProviderType::Cpu => CPU_BASE_TOKEN_BUDGET,
+            ExecutionProviderType::Auto => CPU_BASE_TOKEN_BUDGET, // Conservative default
+            // GPU providers get larger budget
+            _ => GPU_BASE_TOKEN_BUDGET,
+        };
+
+        // Scale inversely with model dimensions
+        // 384 dims → 1.0x budget
+        // 768 dims → 0.5x budget
+        // 1024 dims → 0.375x budget
+        let scale = REFERENCE_DIMS as f64 / model_dims as f64;
+        let scaled_budget = (base_budget as f64 * scale) as usize;
+
+        // Ensure minimum budget of 1000 tokens
+        scaled_budget.max(1000)
+    }
+
+    /// Estimate tokens from text length (rough: 4 chars per token)
+    #[inline]
+    fn estimate_tokens(text_len: usize) -> usize {
+        (text_len + 3) / 4 // Round up
+    }
+
+    /// Embed a batch of chunks using token-budget adaptive batching
+    ///
+    /// Chunks are sorted by length and grouped into batches that fit within
+    /// the token budget. This minimizes padding waste while maximizing throughput.
     pub fn embed_chunks(&mut self, chunks: Vec<Chunk>) -> Result<Vec<EmbeddedChunk>> {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
 
         let total = chunks.len();
+        let start = std::time::Instant::now();
+
+        // Prepare all texts and track original indices
+        let mut indexed_texts: Vec<(usize, String, Chunk)> = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let text = self.prepare_text(&chunk);
+                (idx, text, chunk)
+            })
+            .collect();
+
+        // Sort by text length to minimize padding within batches
+        indexed_texts.sort_by_key(|(_, text, _)| text.len());
+
+        // Create batches using token budget
+        let batches = self.create_token_budget_batches(&indexed_texts);
+        let num_batches = batches.len();
+
         println!(
-            "📊 Embedding {} chunks (batch size: {})...",
-            total, self.batch_size
+            "📊 Embedding {} chunks in {} batches (budget: {} tokens, {}, {} dims)",
+            total, num_batches, self.token_budget, self.provider.name(), self.model_dims
         );
 
-        let start = std::time::Instant::now();
-        let mut embedded_chunks = Vec::with_capacity(total);
+        let mut results: Vec<(usize, EmbeddedChunk)> = Vec::with_capacity(total);
 
-        // Process in batches
-        for (batch_idx, chunk_batch) in chunks.chunks(self.batch_size).enumerate() {
-            let batch_start = batch_idx * self.batch_size;
-            let batch_end = (batch_start + chunk_batch.len()).min(total);
+        for (batch_idx, batch_indices) in batches.iter().enumerate() {
+            let batch: Vec<_> = batch_indices.iter()
+                .map(|&i| &indexed_texts[i])
+                .collect();
+
+            let batch_size = batch.len();
+            let max_len = batch.last().map(|(_, t, _)| t.len()).unwrap_or(0);
+            let tokens_used = Self::estimate_tokens(max_len) * batch_size;
 
             println!(
-                "   Batch {}/{}: chunks {}-{}",
+                "   Batch {}/{}: {} chunks, max_len={}, ~{} tokens",
                 batch_idx + 1,
-                (total + self.batch_size - 1) / self.batch_size,
-                batch_start + 1,
-                batch_end
+                num_batches,
+                batch_size,
+                max_len,
+                tokens_used,
             );
 
-            // Prepare texts for embedding
-            let texts: Vec<String> = chunk_batch
-                .iter()
-                .map(|chunk| self.prepare_text(chunk))
-                .collect();
+            // Extract texts for this batch
+            let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
 
             // Generate embeddings
             let embeddings = self.embedder.lock().unwrap().embed_batch(texts)?;
 
-            // Combine chunks with embeddings
-            for (chunk, embedding) in chunk_batch.iter().zip(embeddings.into_iter()) {
-                embedded_chunks.push(EmbeddedChunk::new(chunk.clone(), embedding));
+            // Combine with original indices
+            for ((orig_idx, _, chunk), embedding) in batch.into_iter().zip(embeddings.into_iter()) {
+                results.push((*orig_idx, EmbeddedChunk::new(chunk.clone(), embedding)));
             }
         }
+
+        // Restore original order
+        results.sort_by_key(|(idx, _)| *idx);
+        let embedded_chunks: Vec<EmbeddedChunk> = results.into_iter().map(|(_, ec)| ec).collect();
 
         let elapsed = start.elapsed();
         println!(
@@ -139,6 +234,45 @@ impl BatchEmbedder {
         );
 
         Ok(embedded_chunks)
+    }
+
+    /// Create batches using token budget
+    ///
+    /// Sliding window through sorted chunks, cutting a new batch when
+    /// adding the next chunk would exceed the token budget.
+    fn create_token_budget_batches(&self, sorted_texts: &[(usize, String, Chunk)]) -> Vec<Vec<usize>> {
+        let mut batches: Vec<Vec<usize>> = Vec::new();
+        let mut current_batch: Vec<usize> = Vec::new();
+
+        for (i, (_, text, _)) in sorted_texts.iter().enumerate() {
+            let chunk_tokens = Self::estimate_tokens(text.len());
+
+            if current_batch.is_empty() {
+                // Start new batch
+                current_batch.push(i);
+            } else {
+                // This chunk is the longest so far (sorted order)
+                // Check if adding it would exceed token budget
+                let new_batch_size = current_batch.len() + 1;
+                let tokens_if_added = chunk_tokens * new_batch_size;
+
+                if tokens_if_added <= self.token_budget {
+                    // Add to current batch
+                    current_batch.push(i);
+                } else {
+                    // Start new batch
+                    batches.push(std::mem::take(&mut current_batch));
+                    current_batch.push(i);
+                }
+            }
+        }
+
+        // Don't forget the last batch
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        batches
     }
 
     /// Embed a single chunk

@@ -104,7 +104,6 @@ pub enum QueryType {
 
 /// Classify query type based on heuristics
 pub fn classify_query(query: &str) -> QueryType {
-    let query_lower = query.to_lowercase();
     let words: Vec<&str> = query.split_whitespace().collect();
 
     // Single word or very short = likely keyword search
@@ -119,7 +118,13 @@ pub fn classify_query(query: &str) -> QueryType {
     }
 
     // Contains code-like tokens = keyword-leaning
+    // These patterns strongly indicate code searches
     if query.contains("::") || query.contains("()") || query.contains("->") || query.contains("=>") {
+        return QueryType::Keyword;
+    }
+
+    // Generic type patterns like Result<T, E> or Vec<String>
+    if query.contains('<') && query.contains('>') {
         return QueryType::Keyword;
     }
 

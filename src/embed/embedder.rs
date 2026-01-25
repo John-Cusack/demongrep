@@ -651,26 +651,28 @@ mod tests {
 
     #[test]
     fn test_optimal_batch_size_cpu() {
-        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(384), 256);
-        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(768), 128);
-        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(1024), 64);
+        // All providers now return 32 (empirically optimal)
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(384), 32);
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(768), 32);
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(1024), 32);
     }
 
     #[test]
     fn test_optimal_batch_size_auto() {
-        // Auto assumes GPU-optimized sizes
-        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(384), 1024);
-        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(768), 512);
-        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(1024), 256);
+        // All providers now return 32 (empirically optimal)
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(384), 32);
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(768), 32);
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(1024), 32);
     }
 
     #[cfg(feature = "cuda")]
     #[test]
     fn test_optimal_batch_size_cuda() {
+        // All providers now return 32 (empirically optimal)
         let cuda = ExecutionProviderType::Cuda { device_id: 0 };
-        assert_eq!(cuda.optimal_batch_size(384), 1024);
-        assert_eq!(cuda.optimal_batch_size(768), 512);
-        assert_eq!(cuda.optimal_batch_size(1024), 256);
+        assert_eq!(cuda.optimal_batch_size(384), 32);
+        assert_eq!(cuda.optimal_batch_size(768), 32);
+        assert_eq!(cuda.optimal_batch_size(1024), 32);
     }
 
     #[test]

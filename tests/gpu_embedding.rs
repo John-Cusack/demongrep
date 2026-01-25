@@ -71,57 +71,57 @@ fn test_execution_provider_from_str_with_device() {
 
 #[test]
 fn test_optimal_batch_size_cpu() {
-    // CPU uses smaller batches to avoid OOM
-    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(384), 256);
-    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(768), 128);
-    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(1024), 64);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(384), 32);
+    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(768), 32);
+    assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(1024), 32);
 }
 
 #[test]
 fn test_optimal_batch_size_auto() {
-    // Auto assumes GPU-optimized sizes since it picks best available
-    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(384), 1024);
-    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(768), 512);
-    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(1024), 256);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(384), 32);
+    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(768), 32);
+    assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(1024), 32);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn test_optimal_batch_size_cuda() {
     let cuda = ExecutionProviderType::Cuda { device_id: 0 };
-    // CUDA benefits from large batches
-    assert_eq!(cuda.optimal_batch_size(384), 1024);
-    assert_eq!(cuda.optimal_batch_size(768), 512);
-    assert_eq!(cuda.optimal_batch_size(1024), 256);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(cuda.optimal_batch_size(384), 32);
+    assert_eq!(cuda.optimal_batch_size(768), 32);
+    assert_eq!(cuda.optimal_batch_size(1024), 32);
 }
 
 #[cfg(feature = "tensorrt")]
 #[test]
 fn test_optimal_batch_size_tensorrt() {
     let trt = ExecutionProviderType::TensorRt { device_id: 0 };
-    // TensorRT also benefits from large batches
-    assert_eq!(trt.optimal_batch_size(384), 1024);
-    assert_eq!(trt.optimal_batch_size(768), 512);
-    assert_eq!(trt.optimal_batch_size(1024), 256);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(trt.optimal_batch_size(384), 32);
+    assert_eq!(trt.optimal_batch_size(768), 32);
+    assert_eq!(trt.optimal_batch_size(1024), 32);
 }
 
 #[cfg(feature = "coreml")]
 #[test]
 fn test_optimal_batch_size_coreml() {
-    // CoreML uses moderate batches
-    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(384), 512);
-    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(768), 256);
-    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(1024), 128);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(384), 32);
+    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(768), 32);
+    assert_eq!(ExecutionProviderType::CoreMl.optimal_batch_size(1024), 32);
 }
 
 #[cfg(feature = "directml")]
 #[test]
 fn test_optimal_batch_size_directml() {
     let dml = ExecutionProviderType::DirectMl { device_id: 0 };
-    // DirectML uses moderate batches
-    assert_eq!(dml.optimal_batch_size(384), 512);
-    assert_eq!(dml.optimal_batch_size(768), 256);
-    assert_eq!(dml.optimal_batch_size(1024), 128);
+    // All providers now return 32 (empirically optimal based on benchmarks)
+    assert_eq!(dml.optimal_batch_size(384), 32);
+    assert_eq!(dml.optimal_batch_size(768), 32);
+    assert_eq!(dml.optimal_batch_size(1024), 32);
 }
 
 #[test]
