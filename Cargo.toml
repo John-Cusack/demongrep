@@ -114,5 +114,14 @@ inherits = "release"
 
 [features]
 default = []
-cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
-tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
+
+# GPU execution providers
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt", "cuda"]
+coreml = ["ort/coreml"]
+directml = ["ort/directml"]
+
+# Convenience aliases
+gpu-nvidia = ["cuda"]
+gpu-apple = ["coreml"]
+gpu-windows = ["directml"]

@@ -94,7 +94,10 @@ impl BatchEmbedder {
         }
 
         let total = chunks.len();
-        println!("📊 Embedding {} chunks (batch size: {})...", total, self.batch_size);
+        println!(
+            "📊 Embedding {} chunks (batch size: {})...",
+            total, self.batch_size
+        );
 
         let start = std::time::Instant::now();
         let mut embedded_chunks = Vec::with_capacity(total);
@@ -196,7 +199,10 @@ impl BatchEmbedder {
 /// Clean docstring by removing comment markers
 fn clean_docstring(doc: &str) -> String {
     // First handle triple-quoted strings and JSDoc as special cases
-    let cleaned = if let Some(stripped) = doc.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\"")) {
+    let cleaned = if let Some(stripped) = doc
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+    {
         stripped
     } else if let Some(stripped) = doc.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")) {
         stripped
@@ -265,7 +271,10 @@ mod tests {
     #[test]
     fn test_clean_docstring() {
         let rust_doc = "/// This is a doc comment\n/// with multiple lines";
-        assert_eq!(clean_docstring(rust_doc), "This is a doc comment with multiple lines");
+        assert_eq!(
+            clean_docstring(rust_doc),
+            "This is a doc comment with multiple lines"
+        );
 
         let python_doc = "\"\"\"This is a Python docstring\"\"\"";
         assert_eq!(clean_docstring(python_doc), "This is a Python docstring");

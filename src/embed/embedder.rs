@@ -1,7 +1,156 @@
 use crate::info_print;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
-use ort::execution_providers::CPUExecutionProvider;
+
+/// Execution provider for embedding inference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionProviderType {
+    #[default]
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Cuda { device_id: i32 },
+    #[cfg(feature = "tensorrt")]
+    TensorRt { device_id: i32 },
+    #[cfg(feature = "coreml")]
+    CoreMl,
+    #[cfg(feature = "directml")]
+    DirectMl { device_id: i32 },
+    Auto,
+}
+
+impl ExecutionProviderType {
+    /// Parse provider from string
+    pub fn from_str(s: &str, device_id: i32) -> Result<Self, &'static str> {
+        match s.to_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => {
+                #[cfg(feature = "cuda")]
+                {
+                    Ok(Self::Cuda { device_id })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = device_id;
+                    Err("CUDA support not compiled in")
+                }
+            }
+            "tensorrt" => {
+                #[cfg(feature = "tensorrt")]
+                {
+                    Ok(Self::TensorRt { device_id })
+                }
+                #[cfg(not(feature = "tensorrt"))]
+                {
+                    let _ = device_id;
+                    Err("TensorRT support not compiled in")
+                }
+            }
+            "coreml" => {
+                #[cfg(feature = "coreml")]
+                {
+                    Ok(Self::CoreMl)
+                }
+                #[cfg(not(feature = "coreml"))]
+                {
+                    Err("CoreML support not compiled in")
+                }
+            }
+            "directml" => {
+                #[cfg(feature = "directml")]
+                {
+                    Ok(Self::DirectMl { device_id })
+                }
+                #[cfg(not(feature = "directml"))]
+                {
+                    let _ = device_id;
+                    Err("DirectML support not compiled in")
+                }
+            }
+            "auto" => Ok(Self::Auto),
+            _ => Err("Invalid provider. Use: auto, cpu, cuda, tensorrt, coreml, directml"),
+        }
+    }
+
+    /// Get optimal batch size for this provider based on model dimensions
+    /// GPU providers benefit from larger batches, CPU uses smaller batches
+    pub fn optimal_batch_size(&self, dimensions: usize) -> usize {
+        match self {
+            Self::Cpu => match dimensions {
+                d if d <= 384 => 256,
+                d if d <= 768 => 128,
+                _ => 64,
+            },
+            #[cfg(feature = "cuda")]
+            Self::Cuda { .. } => match dimensions {
+                d if d <= 384 => 1024,
+                d if d <= 768 => 512,
+                _ => 256,
+            },
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt { .. } => match dimensions {
+                d if d <= 384 => 1024,
+                d if d <= 768 => 512,
+                _ => 256,
+            },
+            #[cfg(feature = "coreml")]
+            Self::CoreMl => match dimensions {
+                d if d <= 384 => 512,
+                d if d <= 768 => 256,
+                _ => 128,
+            },
+            #[cfg(feature = "directml")]
+            Self::DirectMl { .. } => match dimensions {
+                d if d <= 384 => 512,
+                d if d <= 768 => 256,
+                _ => 128,
+            },
+            Self::Auto => match dimensions {
+                // Auto assumes GPU-optimized sizes since it will pick the best available
+                d if d <= 384 => 1024,
+                d if d <= 768 => 512,
+                _ => 256,
+            },
+        }
+    }
+
+    /// Get provider name for display
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            #[cfg(feature = "cuda")]
+            Self::Cuda { .. } => "CUDA",
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt { .. } => "TensorRT",
+            #[cfg(feature = "coreml")]
+            Self::CoreMl => "CoreML",
+            #[cfg(feature = "directml")]
+            Self::DirectMl { .. } => "DirectML",
+            Self::Auto => "Auto",
+        }
+    }
+
+    /// Convert to fastembed execution provider dispatch
+    fn to_fastembed_provider(&self) -> fastembed::ExecutionProviderDispatch {
+        match self {
+            Self::Cpu => fastembed::ExecutionProviderDispatch::Cpu,
+            #[cfg(feature = "cuda")]
+            Self::Cuda { device_id } => fastembed::ExecutionProviderDispatch::Cuda {
+                device_id: *device_id,
+            },
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt { device_id } => fastembed::ExecutionProviderDispatch::TensorRt {
+                device_id: *device_id,
+            },
+            #[cfg(feature = "coreml")]
+            Self::CoreMl => fastembed::ExecutionProviderDispatch::CoreMl,
+            #[cfg(feature = "directml")]
+            Self::DirectMl { device_id } => fastembed::ExecutionProviderDispatch::DirectMl {
+                device_id: *device_id,
+            },
+            Self::Auto => fastembed::ExecutionProviderDispatch::Cpu, // Auto resolves before this
+        }
+    }
+}
 
 /// Available embedding models
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +240,7 @@ impl ModelType {
             | Self::NomicEmbedTextV15Q
             | Self::JinaEmbeddingsV2BaseCode => 768,
             // 1024 dimensions
-            Self::BGELargeENV15
-            | Self::MxbaiEmbedLargeV1
-            | Self::ModernBertEmbedLarge => 1024,
+            Self::BGELargeENV15 | Self::MxbaiEmbedLargeV1 | Self::ModernBertEmbedLarge => 1024,
         }
     }
 
@@ -204,10 +351,69 @@ impl Default for ModelType {
     }
 }
 
+/// Detect the best available execution provider
+/// Priority: TensorRT > CUDA > CoreML > DirectML > CPU
+pub fn detect_best_provider() -> ExecutionProviderType {
+    #[cfg(feature = "tensorrt")]
+    {
+        if is_tensorrt_available() {
+            return ExecutionProviderType::TensorRt { device_id: 0 };
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        if is_cuda_available() {
+            return ExecutionProviderType::Cuda { device_id: 0 };
+        }
+    }
+
+    #[cfg(feature = "coreml")]
+    {
+        if is_coreml_available() {
+            return ExecutionProviderType::CoreMl;
+        }
+    }
+
+    #[cfg(feature = "directml")]
+    {
+        if is_directml_available() {
+            return ExecutionProviderType::DirectMl { device_id: 0 };
+        }
+    }
+
+    ExecutionProviderType::Cpu
+}
+
+#[cfg(feature = "cuda")]
+pub fn is_cuda_available() -> bool {
+    use ort::execution_providers::CUDAExecutionProvider;
+    CUDAExecutionProvider::default().is_available()
+}
+
+#[cfg(feature = "tensorrt")]
+fn is_tensorrt_available() -> bool {
+    use ort::execution_providers::TensorRTExecutionProvider;
+    TensorRTExecutionProvider::default().is_available()
+}
+
+#[cfg(feature = "coreml")]
+fn is_coreml_available() -> bool {
+    use ort::execution_providers::CoreMLExecutionProvider;
+    CoreMLExecutionProvider::default().is_available()
+}
+
+#[cfg(feature = "directml")]
+fn is_directml_available() -> bool {
+    use ort::execution_providers::DirectMLExecutionProvider;
+    DirectMLExecutionProvider::default().is_available()
+}
+
 /// Fast embedding model using fastembed library
 pub struct FastEmbedder {
     model: TextEmbedding,
     model_type: ModelType,
+    provider: ExecutionProviderType,
 }
 
 impl FastEmbedder {
@@ -218,48 +424,94 @@ impl FastEmbedder {
 
     /// Create a new embedder with specified model
     pub fn with_model(model_type: ModelType) -> Result<Self> {
+        Self::with_model_and_provider(model_type, ExecutionProviderType::Auto, None)
+    }
+
+    /// Create a new embedder with specified model and execution provider
+    pub fn with_model_and_provider(
+        model_type: ModelType,
+        provider: ExecutionProviderType,
+        device_id: Option<i32>,
+    ) -> Result<Self> {
         info_print!("📦 Loading embedding model: {}", model_type.name());
         info_print!("   Dimensions: {}", model_type.dimensions());
+        info_print!("   Execution provider: {}", provider.name());
 
-        // Use CPU execution provider with arena allocator for better memory performance
-        let cpu_ep = CPUExecutionProvider::default()
-            .with_arena_allocator(true)
-            .build();
+        // Resolve Auto to the actual best provider
+        let resolved_provider = match provider {
+            ExecutionProviderType::Auto => detect_best_provider(),
+            other => other,
+        };
+
+        if provider == ExecutionProviderType::Auto
+            && resolved_provider != ExecutionProviderType::Auto
+        {
+            info_print!("   Resolved provider: {}", resolved_provider.name());
+        }
+
+        // Apply device_id override if specified
+        let final_provider = match (resolved_provider, device_id) {
+            #[cfg(feature = "cuda")]
+            (ExecutionProviderType::Cuda { .. }, Some(id)) => {
+                ExecutionProviderType::Cuda { device_id: id }
+            }
+            #[cfg(feature = "tensorrt")]
+            (ExecutionProviderType::TensorRt { .. }, Some(id)) => {
+                ExecutionProviderType::TensorRt { device_id: id }
+            }
+            #[cfg(feature = "directml")]
+            (ExecutionProviderType::DirectMl { .. }, Some(id)) => {
+                ExecutionProviderType::DirectMl { device_id: id }
+            }
+            (p, _) => p,
+        };
+
+        let fastembed_provider = final_provider.to_fastembed_provider();
+        let execution_providers = vec![fastembed_provider];
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())
                 .with_show_download_progress(true)
-                .with_execution_providers(vec![cpu_ep])
+                .with_execution_providers(execution_providers),
         )
-            .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
+        .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
         info_print!("✅ Model loaded successfully!");
+        info_print!(
+            "   Optimal batch size: {}",
+            final_provider.optimal_batch_size(model_type.dimensions())
+        );
 
-        Ok(Self { model, model_type })
+        Ok(Self {
+            model,
+            model_type,
+            provider: final_provider,
+        })
     }
 
     /// Embed a batch of texts (processes in mini-batches to avoid OOM)
-    /// Uses adaptive batch size based on model dimensions
+    /// Uses provider-specific optimal batch size
     /// Can be overridden with DEMONGREP_BATCH_SIZE environment variable
     pub fn embed_batch(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         // Check for env var override (tune with DEMONGREP_BATCH_SIZE=N)
         let batch_size = if let Ok(env_size) = std::env::var("DEMONGREP_BATCH_SIZE") {
             env_size.parse().unwrap_or(256)
         } else {
-            // Adaptive batch size: smaller batches for larger models to avoid OOM
-            // Benchmarked on 12-core/24-thread CPU - batch size has minimal impact
-            // when CPU is saturated, but larger batches slightly more efficient
-            match self.model_type.dimensions() {
-                d if d <= 384 => 256,  // Small models: larger batches OK
-                d if d <= 768 => 128,  // Medium models
-                _ => 64,               // Large models: smaller to avoid OOM
-            }
+            // Use provider-specific optimal batch size
+            // GPU providers (CUDA, TensorRT) benefit from larger batches (256-1024)
+            // CPU providers use smaller batches (64-256)
+            self.provider
+                .optimal_batch_size(self.model_type.dimensions())
         };
         self.embed_batch_chunked(texts, batch_size)
     }
 
     /// Embed a batch of texts with configurable mini-batch size
-    pub fn embed_batch_chunked(&mut self, texts: Vec<String>, batch_size: usize) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_batch_chunked(
+        &mut self,
+        texts: Vec<String>,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -304,6 +556,11 @@ impl FastEmbedder {
     pub fn model_type(&self) -> ModelType {
         self.model_type
     }
+
+    /// Get the execution provider
+    pub fn provider(&self) -> ExecutionProviderType {
+        self.provider
+    }
 }
 
 impl Default for FastEmbedder {
@@ -339,8 +596,14 @@ mod tests {
     #[test]
     fn test_model_type_names() {
         assert_eq!(ModelType::BGESmallENV15.name(), "BAAI/bge-small-en-v1.5");
-        assert_eq!(ModelType::AllMiniLML6V2.name(), "sentence-transformers/all-MiniLM-L6-v2");
-        assert_eq!(ModelType::JinaEmbeddingsV2BaseCode.name(), "jinaai/jina-embeddings-v2-base-code");
+        assert_eq!(
+            ModelType::AllMiniLML6V2.name(),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            ModelType::JinaEmbeddingsV2BaseCode.name(),
+            "jinaai/jina-embeddings-v2-base-code"
+        );
     }
 
     #[test]
@@ -358,9 +621,18 @@ mod tests {
 
     #[test]
     fn test_from_str() {
-        assert_eq!(ModelType::from_str("bge-small"), Some(ModelType::BGESmallENV15));
-        assert_eq!(ModelType::from_str("jina-code"), Some(ModelType::JinaEmbeddingsV2BaseCode));
-        assert_eq!(ModelType::from_str("minilm-l6-q"), Some(ModelType::AllMiniLML6V2Q));
+        assert_eq!(
+            ModelType::from_str("bge-small"),
+            Some(ModelType::BGESmallENV15)
+        );
+        assert_eq!(
+            ModelType::from_str("jina-code"),
+            Some(ModelType::JinaEmbeddingsV2BaseCode)
+        );
+        assert_eq!(
+            ModelType::from_str("minilm-l6-q"),
+            Some(ModelType::AllMiniLML6V2Q)
+        );
         assert_eq!(ModelType::from_str("unknown"), None);
     }
 
@@ -373,6 +645,54 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_provider_from_str() {
+        assert_eq!(
+            ExecutionProviderType::from_str("cpu", 0).unwrap(),
+            ExecutionProviderType::Cpu
+        );
+        assert_eq!(
+            ExecutionProviderType::from_str("auto", 0).unwrap(),
+            ExecutionProviderType::Auto
+        );
+        assert_eq!(
+            ExecutionProviderType::from_str("CPU", 0).unwrap(),
+            ExecutionProviderType::Cpu
+        );
+        assert!(ExecutionProviderType::from_str("invalid", 0).is_err());
+    }
+
+    #[test]
+    fn test_optimal_batch_size_cpu() {
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(384), 256);
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(768), 128);
+        assert_eq!(ExecutionProviderType::Cpu.optimal_batch_size(1024), 64);
+    }
+
+    #[test]
+    fn test_optimal_batch_size_auto() {
+        // Auto assumes GPU-optimized sizes
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(384), 1024);
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(768), 512);
+        assert_eq!(ExecutionProviderType::Auto.optimal_batch_size(1024), 256);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_optimal_batch_size_cuda() {
+        let cuda = ExecutionProviderType::Cuda { device_id: 0 };
+        assert_eq!(cuda.optimal_batch_size(384), 1024);
+        assert_eq!(cuda.optimal_batch_size(768), 512);
+        assert_eq!(cuda.optimal_batch_size(1024), 256);
+    }
+
+    #[test]
+    fn test_detect_best_provider_returns_valid() {
+        let provider = detect_best_provider();
+        // Should never return Auto
+        assert_ne!(provider, ExecutionProviderType::Auto);
+    }
+
+    #[test]
     #[ignore] // Requires downloading model
     fn test_embedder_creation() {
         let embedder = FastEmbedder::new();
@@ -380,6 +700,18 @@ mod tests {
 
         let embedder = embedder.unwrap();
         assert_eq!(embedder.dimensions(), 384);
+    }
+
+    #[test]
+    #[ignore] // Requires model
+    fn test_embedder_stores_provider() {
+        let embedder = FastEmbedder::with_model_and_provider(
+            ModelType::AllMiniLML6V2Q,
+            ExecutionProviderType::Cpu,
+            None,
+        )
+        .unwrap();
+        assert_eq!(embedder.provider(), ExecutionProviderType::Cpu);
     }
 
     #[test]

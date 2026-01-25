@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::embed::ModelType;
+use crate::embed::{ModelType, ExecutionProviderType};
 
 /// Fast, local semantic code search powered by Rust
 #[derive(Parser, Debug)]
@@ -30,6 +30,10 @@ pub struct Cli {
     ///            jina-code, e5-multilingual, mxbai-large, modernbert-large
     #[arg(long, global = true)]
     pub model: Option<String>,
+
+    /// Batch size for embedding (default determined by provider)
+    #[arg(long, global = true)]
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,6 +94,14 @@ pub enum Commands {
         /// Filter results to files under this path (e.g., "src/")
         #[arg(long)]
         filter_path: Option<String>,
+
+        /// Execution provider for embeddings (auto, cpu, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "auto")]
+        provider: String,
+
+        /// GPU device ID to use (for CUDA/TensorRT)
+        #[arg(long, default_value = "0")]
+        device_id: i32,
     },
 
     /// Index the repository
@@ -108,6 +120,14 @@ pub enum Commands {
         /// Index to global database in home directory instead of local .demongrep.db
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Execution provider for embeddings (auto, cpu, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "auto")]
+        provider: String,
+
+        /// GPU device ID to use (for CUDA/TensorRT)
+        #[arg(long, default_value = "0")]
+        device_id: i32,
     },
 
     /// Run a background server with live file watching
@@ -173,6 +193,25 @@ pub async fn run() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Parse provider from CLI flag
+    let provider_type = match cli.command {
+        Commands::Search { ref provider, .. } => {
+            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+                eprintln!("  auto, cpu, cuda, tensorrt, coreml, directml");
+                std::process::exit(1);
+            })
+        }
+        Commands::Index { ref provider, .. } => {
+            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+                eprintln!("  auto, cpu, cuda, tensorrt, coreml, directml");
+                std::process::exit(1);
+            })
+        }
+        _ => ExecutionProviderType::Auto,
+    };
+
     // Set quiet mode if requested
     if cli.quiet {
         crate::output::set_quiet(true);
@@ -194,6 +233,8 @@ pub async fn run() -> Result<()> {
             rerank,
             rerank_top,
             filter_path,
+            provider: _,
+            device_id,
         } => {
             // Auto-enable quiet mode for JSON output
             if json {
@@ -215,6 +256,9 @@ pub async fn run() -> Result<()> {
                 rrf_k,
                 rerank,
                 rerank_top,
+                provider_type,
+                device_id,
+                cli.batch_size,
             )
             .await
         }
@@ -223,7 +267,9 @@ pub async fn run() -> Result<()> {
             dry_run,
             force,
             global,
-        } => crate::index::index(path, dry_run, force, global, model_type).await,
+            provider: _,
+            device_id,
+        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, device_id, cli.batch_size).await,
         Commands::Serve { port, path } => crate::server::serve(port, path).await,
         Commands::List => crate::index::list().await,
         Commands::Stats { path } => crate::index::stats(path).await,

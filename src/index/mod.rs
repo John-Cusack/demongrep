@@ -200,7 +200,7 @@ fn remove_from_project_mapping(project_name: &str) -> Result<()> {
 }
 
 /// Index a repository
-pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: bool, model: Option<ModelType>) -> Result<()> {
+pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: bool, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
     
@@ -413,7 +413,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: b
     let start = Instant::now();
     println!("🔄 Initializing embedding model...");
 
-    let mut embedding_service = EmbeddingService::with_model(model_type)?;
+    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
     println!("✅ Model loaded: {} ({} dims)", embedding_service.model_name(), embedding_service.dimensions());
 
     let embedded_chunks = if all_chunks.is_empty() {

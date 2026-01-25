@@ -1,10 +1,13 @@
-mod embedder;
 mod batch;
 mod cache;
+mod embedder;
 
-pub use embedder::{FastEmbedder, ModelType};
 pub use batch::{BatchEmbedder, EmbeddedChunk};
-pub use cache::{CachedBatchEmbedder, CacheStats};
+pub use cache::{CacheStats, CachedBatchEmbedder};
+pub use embedder::{detect_best_provider, ExecutionProviderType, FastEmbedder, ModelType};
+
+#[cfg(feature = "cuda")]
+pub use embedder::is_cuda_available;
 
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -23,9 +26,28 @@ impl EmbeddingService {
 
     /// Create a new embedding service with specified model
     pub fn with_model(model_type: ModelType) -> Result<Self> {
-        let embedder = FastEmbedder::with_model(model_type)?;
+        Self::with_model_and_provider(model_type, ExecutionProviderType::Auto, None, None)
+    }
+
+    /// Create a new embedding service with specified model and execution provider
+    pub fn with_model_and_provider(
+        model_type: ModelType,
+        provider: ExecutionProviderType,
+        device_id: Option<i32>,
+        batch_size: Option<usize>,
+    ) -> Result<Self> {
+        let embedder = FastEmbedder::with_model_and_provider(model_type, provider, device_id)?;
+        let resolved_provider = embedder.provider();
         let arc_embedder = Arc::new(Mutex::new(embedder));
-        let batch_embedder = BatchEmbedder::new(arc_embedder);
+
+        // Use explicit batch_size if provided, otherwise use provider's optimal size
+        let batch_embedder = match batch_size {
+            Some(size) => BatchEmbedder::with_batch_size(arc_embedder, size),
+            None => {
+                let optimal = resolved_provider.optimal_batch_size(model_type.dimensions());
+                BatchEmbedder::with_batch_size(arc_embedder, optimal)
+            }
+        };
         let cached_embedder = CachedBatchEmbedder::new(batch_embedder);
 
         Ok(Self {
@@ -35,7 +57,10 @@ impl EmbeddingService {
     }
 
     /// Embed a batch of chunks with caching
-    pub fn embed_chunks(&mut self, chunks: Vec<crate::chunker::Chunk>) -> Result<Vec<EmbeddedChunk>> {
+    pub fn embed_chunks(
+        &mut self,
+        chunks: Vec<crate::chunker::Chunk>,
+    ) -> Result<Vec<EmbeddedChunk>> {
         self.cached_embedder.embed_chunks(chunks)
     }
 
@@ -138,6 +163,18 @@ mod tests {
         let query_embedding = service.embed_query("find authentication code").unwrap();
 
         assert_eq!(query_embedding.len(), 384);
+    }
+
+    #[test]
+    #[ignore] // Requires model
+    fn test_embedding_service_with_batch_size() {
+        let service = EmbeddingService::with_model_and_provider(
+            ModelType::AllMiniLML6V2Q,
+            ExecutionProviderType::Cpu,
+            None,
+            Some(128), // explicit batch size
+        );
+        assert!(service.is_ok());
     }
 
     #[test]

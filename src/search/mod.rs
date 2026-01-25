@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingService, ModelType, ExecutionProviderType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::index::get_search_db_paths;
@@ -80,6 +80,9 @@ pub async fn search(
     rrf_k: f32,
     rerank: bool,
     rerank_top: usize,
+    provider: ExecutionProviderType,
+    device_id: Option<i32>,
+    batch_size: Option<usize>,
 ) -> Result<()> {
     // Get all database paths (local + global)
     let db_paths = get_search_db_paths(path.clone())?;
@@ -126,7 +129,7 @@ pub async fn search(
     
     // Initialize embedding service once (shared across all databases)
     let start = Instant::now();
-    let mut embedding_service = EmbeddingService::with_model(model_type)?;
+    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
     model_load_duration = start.elapsed();
     
     // Embed query once
@@ -378,7 +381,7 @@ pub async fn search(
 }
 
 /// Sync database by re-indexing changed files
-fn sync_database(db_path: &PathBuf, model_type: ModelType) -> Result<()> {
+fn sync_database(db_path: &PathBuf, model_type: ModelType, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
     let project_path = db_path.parent().unwrap_or(std::path::Path::new("."));
 
     // Load file metadata store
@@ -389,7 +392,7 @@ fn sync_database(db_path: &PathBuf, model_type: ModelType) -> Result<()> {
     let (files, _stats) = walker.walk()?;
 
     // Initialize services
-    let mut embedding_service = EmbeddingService::with_model(model_type)?;
+    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut store = VectorStore::new(db_path, model_type.dimensions())?;
 
