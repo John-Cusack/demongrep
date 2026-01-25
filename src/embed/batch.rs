@@ -1,16 +1,26 @@
 use super::embedder::{ExecutionProviderType, FastEmbedder};
 use crate::chunker::Chunk;
 use anyhow::Result;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-/// Memory estimation constants
-const BYTES_PER_DIM_FACTOR: usize = 60;  // ~60 bytes per dimension per token (conservative estimate for transformer inference)
-const SAFETY_FACTOR: f64 = 0.5;          // Use 50% of available memory for batching
-const MIN_TOKEN_BUDGET: usize = 1_000;   // Minimum budget to ensure progress
-const MAX_TOKEN_BUDGET: usize = 1_000_000; // Cap to avoid other bottlenecks
-const DEFAULT_GPU_MEMORY_MB: usize = 8_000;  // Fallback: 8GB
-const DEFAULT_CPU_MEMORY_MB: usize = 16_000; // Fallback: 16GB
+// TODO: Better calculation of optimal token budget based on:
+//   - Actual GPU memory bandwidth (not just capacity)
+//   - Model architecture (layers, attention heads)
+//   - Chunk length distribution in the corpus
+//   - Empirical profiling per GPU model
+//
+// Current values are empirically determined on RTX A2000 8GB.
+// Benchmarks showed 10K tokens optimal (70.4 c/s vs 53.2 c/s at 4K, 48.5 c/s at 177K).
+
+/// Optimal token budget - empirically determined sweet spot
+/// Balances batch overhead (too small) vs memory bandwidth limits (too large)
+const DEFAULT_TOKEN_BUDGET: usize = 10_000;
+
+/// Minimum budget to ensure progress
+const MIN_TOKEN_BUDGET: usize = 1_000;
+
+/// Maximum budget cap (larger batches show diminishing/negative returns)
+const MAX_TOKEN_BUDGET: usize = 50_000;
 
 /// Statistics for embedding operations
 #[derive(Debug, Clone, Default)]
@@ -88,7 +98,14 @@ impl BatchEmbedder {
             let e = embedder.lock().unwrap();
             (e.provider(), e.dimensions())
         };
-        let token_budget = Self::calculate_token_budget(&provider, model_dims);
+
+        // Allow override via environment variable for testing
+        let token_budget = if let Ok(val) = std::env::var("DEMONGREP_TOKEN_BUDGET") {
+            val.parse().unwrap_or_else(|_| Self::calculate_token_budget(&provider, model_dims))
+        } else {
+            Self::calculate_token_budget(&provider, model_dims)
+        };
+
         Self {
             embedder,
             token_budget,
@@ -129,77 +146,19 @@ impl BatchEmbedder {
         }
     }
 
-    /// Calculate token budget based on available memory and model dimensions
+    /// Calculate token budget based on model dimensions
     ///
-    /// Formula: token_budget = (available_memory * safety_factor) / memory_per_token
-    /// Where memory_per_token scales with model dimensions
-    fn calculate_token_budget(provider: &ExecutionProviderType, model_dims: usize) -> usize {
-        let available_memory_mb = Self::detect_available_memory(provider);
-        let available_memory_bytes = available_memory_mb * 1024 * 1024;
+    /// Uses empirically-determined optimal budget, scaled for model size.
+    /// Larger models need smaller batches to stay within memory bandwidth limits.
+    fn calculate_token_budget(_provider: &ExecutionProviderType, model_dims: usize) -> usize {
+        // Scale budget inversely with model dimensions
+        // 384 dims (base) → 10K tokens
+        // 768 dims → 5K tokens
+        // 1024 dims → ~3.75K tokens
+        let scale = 384.0 / model_dims as f64;
+        let scaled_budget = (DEFAULT_TOKEN_BUDGET as f64 * scale) as usize;
 
-        // Memory per token scales with model dimensions
-        // Rough estimate: each dimension needs ~60 bytes during inference
-        // (includes embeddings, attention, intermediate activations)
-        let memory_per_token = model_dims * BYTES_PER_DIM_FACTOR;
-
-        // Calculate budget with safety factor
-        let usable_memory = (available_memory_bytes as f64 * SAFETY_FACTOR) as usize;
-        let token_budget = usable_memory / memory_per_token;
-
-        // Clamp to reasonable bounds
-        token_budget.clamp(MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET)
-    }
-
-    /// Detect available memory (VRAM for GPU, RAM for CPU)
-    fn detect_available_memory(provider: &ExecutionProviderType) -> usize {
-        match provider {
-            ExecutionProviderType::Cpu | ExecutionProviderType::Auto => {
-                Self::detect_system_ram().unwrap_or(DEFAULT_CPU_MEMORY_MB)
-            }
-            _ => {
-                // GPU provider - try to detect VRAM
-                Self::detect_gpu_vram().unwrap_or(DEFAULT_GPU_MEMORY_MB)
-            }
-        }
-    }
-
-    /// Detect GPU VRAM using nvidia-smi
-    fn detect_gpu_vram() -> Option<usize> {
-        let output = Command::new("nvidia-smi")
-            .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Take the first GPU's free memory (in MB)
-        stdout.lines()
-            .next()?
-            .trim()
-            .parse::<usize>()
-            .ok()
-    }
-
-    /// Detect available system RAM
-    fn detect_system_ram() -> Option<usize> {
-        // Try to read from /proc/meminfo on Linux
-        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-            for line in contents.lines() {
-                if line.starts_with("MemAvailable:") {
-                    // Format: "MemAvailable:    12345678 kB"
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(kb) = parts[1].parse::<usize>() {
-                            return Some(kb / 1024); // Convert to MB
-                        }
-                    }
-                }
-            }
-        }
-        None
+        scaled_budget.clamp(MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET)
     }
 
     /// Estimate tokens from text length (rough: 4 chars per token)

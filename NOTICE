@@ -1,0 +1,15 @@
+demongrep
+Copyright 2024 yxanul (Original Author)
+
+This product includes software developed by yxanul.
+Original repository: https://github.com/yxanul/demongrep
+
+Modifications by John (2025-2026):
+- Added GPU acceleration support (CUDA, TensorRT, CoreML, DirectML)
+- Added --provider, --device-id, --batch-size CLI options
+- Implemented adaptive token-budget batching for optimized embedding generation
+- Chunks sorted by length to minimize padding waste
+- Dynamic batch sizing based on model dimensions
+- Environment variable DEMONGREP_TOKEN_BUDGET for tuning
+
+Licensed under the Apache License, Version 2.0.

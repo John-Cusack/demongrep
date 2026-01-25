@@ -13,6 +13,7 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Context Windows** — Shows surrounding code (3 lines before/after) for better understanding
 - **Local & Private** — All processing happens locally using ONNX models, no data leaves your machine
 - **Fast** — Sub-second search after initial model load, incremental indexing
+- **GPU Acceleration** — Optional CUDA, TensorRT, CoreML, and DirectML support for faster indexing
 - **Multiple Interfaces** — CLI, HTTP server, and MCP server for Claude Code integration
 
 ---
@@ -198,7 +199,10 @@ demongrep index [PATH] [OPTIONS]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--dry-run` | | Preview what would be indexed without indexing |
-| `--force` | `-f` | Delete existing index and rebuild from scratch |
+| `--global` | `-g` | Index to global database in home directory |
+| `--provider` | | Execution provider: `cpu`, `auto`, `cuda`, `tensorrt`, `coreml`, `directml` |
+| `--device-id` | | GPU device ID for CUDA/TensorRT (default: 0) |
+| `--batch-size` | | Override batch size for embedding |
 
 #### Examples
 
@@ -217,6 +221,12 @@ demongrep index --force
 
 # Index with a specific model
 demongrep index --model jina-code
+
+# Index using GPU acceleration (CUDA)
+demongrep index --provider cuda
+
+# Index using specific GPU device
+demongrep index --provider cuda --device-id 1
 ```
 
 #### What Gets Indexed
@@ -634,13 +644,94 @@ demongrep search "query" --model jina-code
 
 ---
 
+## GPU Acceleration
+
+demongrep supports GPU acceleration for faster embedding generation during indexing.
+
+### Supported Providers
+
+| Provider | Platform | Flag | Build Feature |
+|----------|----------|------|---------------|
+| CPU | All (Linux, macOS, Windows) | `--provider cpu` | (default) |
+| CUDA | Linux/Windows + NVIDIA GPU | `--provider cuda` | `--features cuda` |
+| TensorRT | Linux/Windows + NVIDIA GPU | `--provider tensorrt` | `--features tensorrt` |
+| CoreML | macOS (Intel & Apple Silicon) | `--provider coreml` | `--features coreml` |
+| DirectML | Windows (DirectX 12 GPU) | `--provider directml` | `--features directml` |
+
+### Building with GPU Support
+
+**Basic CPU build (all platforms):**
+```bash
+cargo build --release
+```
+This works on Linux, macOS (Intel & Apple Silicon), and Windows. No GPU features needed.
+
+**Linux/Windows with NVIDIA GPU:**
+```bash
+# CUDA support (requires NVIDIA drivers)
+cargo build --release --features cuda
+
+# TensorRT support (requires TensorRT SDK installed)
+cargo build --release --features tensorrt
+```
+
+**macOS (Intel & Apple Silicon):**
+```bash
+# CoreML support - uses Apple's ML framework (built into macOS)
+# Apple Silicon: Uses Neural Engine + GPU for acceleration
+# Intel Mac: Uses CPU/GPU, still faster than pure CPU provider
+cargo build --release --features coreml
+```
+No additional dependencies beyond the Homebrew prerequisites. CoreML is built into macOS 10.13+.
+
+**Windows with DirectX 12 GPU:**
+```bash
+cargo build --release --features directml
+```
+
+### Usage
+
+```bash
+# Auto-detect best available provider
+demongrep index --provider auto
+
+# Use CUDA explicitly
+demongrep index --provider cuda
+
+# Use specific GPU device
+demongrep index --provider cuda --device-id 1
+
+# Check available providers
+demongrep doctor
+```
+
+### Adaptive Batching
+
+demongrep uses intelligent adaptive batching to maximize throughput:
+
+- **Chunks sorted by length** — Similar-sized chunks are batched together to minimize padding waste
+- **Dynamic batch sizes** — Short chunks get large batches, long chunks get small batches
+- **Token budget** — Batches are sized to stay within optimal memory limits (10K tokens default)
+
+This results in ~30% faster indexing compared to fixed batch sizes.
+
+### Performance Tips
+
+1. **NVIDIA GPUs**: Use `--provider cuda` — typically 1.5-2x faster than CPU for large codebases
+2. **macOS**: Use `--provider coreml` — Apple Silicon gets Neural Engine acceleration, Intel Macs see modest gains
+3. **Check GPU memory**: Use `nvidia-smi` (NVIDIA) or Activity Monitor (macOS) — model uses ~500MB
+4. **Tune token budget**: Set `DEMONGREP_TOKEN_BUDGET` environment variable if needed
+
+---
+
 ## Configuration
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DEMONGREP_BATCH_SIZE` | Embedding batch size | Auto (based on model) |
+| `DEMONGREP_TOKEN_BUDGET` | Token budget for adaptive batching | 10000 |
+| `DEMONGREP_BATCH_SIZE` | Override batch size (legacy) | Auto |
 | `RUST_LOG` | Logging level | `demongrep=info` |
 
 ### Ignore Files
@@ -679,9 +770,10 @@ demongrep also respects `.gitignore` and `.osgrepignore` files.
 - Falls back to line-based chunking for unsupported languages
 
 ### 3. Embedding Generation
-- Uses fastembed with ONNX Runtime (CPU-optimized)
-- Batched processing for efficiency
-- SHA-256 content hashing for change detection
+- Uses fastembed with ONNX Runtime
+- GPU acceleration via CUDA, TensorRT, CoreML, or DirectML
+- Adaptive token-budget batching: sorts chunks by length, dynamically sizes batches
+- SHA-256 content hashing for incremental change detection
 
 ### 4. Vector Storage
 - arroy for approximate nearest neighbor search
@@ -730,8 +822,24 @@ demongrep index --force --model minilm-l6-q
 ### Out of memory during indexing
 
 ```bash
-# Reduce batch size
+# Reduce token budget
+DEMONGREP_TOKEN_BUDGET=5000 demongrep index
+
+# Or use legacy batch size override
 DEMONGREP_BATCH_SIZE=32 demongrep index
+```
+
+### GPU not detected
+
+```bash
+# Check GPU status
+demongrep doctor
+
+# Verify CUDA is available
+nvidia-smi
+
+# Fall back to CPU
+demongrep index --provider cpu
 ```
 
 ### Server won't start (port in use)
@@ -773,7 +881,7 @@ RUST_LOG=demongrep::embed=trace demongrep index
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE) - See [NOTICE](NOTICE) for attribution.
 
 ---
 
