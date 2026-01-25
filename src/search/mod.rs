@@ -10,7 +10,7 @@ use crate::embed::{EmbeddingService, ModelType, ExecutionProviderType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::index::get_search_db_paths;
-use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker};
+use crate::rerank::{weighted_rrf_fusion, vector_only, classify_query, query_alpha, FusedResult, NeuralReranker};
 use crate::vectordb::VectorStore;
 
 /// JSON output format for search results
@@ -136,7 +136,15 @@ pub async fn search(
     let start = Instant::now();
     let query_embedding = embedding_service.embed_query(query)?;
     total_embed_duration = start.elapsed();
-    
+
+    // Classify query for adaptive weighting
+    let query_type = classify_query(query);
+    let alpha = query_alpha(query_type);
+
+    if !json && scores {
+        println!("Query classification: {:?} (alpha={:.2})", query_type, alpha);
+    }
+
     // Search in each database
     for db_path in db_paths {
 
@@ -165,7 +173,8 @@ pub async fn search(
             match FtsStore::open_readonly(&db_path) {
                 Ok(fts_store) => {
                     let fts_results = fts_store.search(query, retrieval_limit)?;
-                    rrf_fusion(&vector_results, &fts_results, rrf_k)
+                    // Use weighted RRF with query-dependent alpha
+                    weighted_rrf_fusion(&vector_results, &fts_results, rrf_k, alpha)
                 }
                 Err(_) => {
                     if !json {

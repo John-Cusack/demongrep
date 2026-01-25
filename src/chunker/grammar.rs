@@ -71,6 +71,7 @@ impl GrammarManager {
             Language::Ruby => Ok(tree_sitter_ruby::LANGUAGE.into()),
             Language::Php => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
             Language::Shell => Ok(tree_sitter_bash::LANGUAGE.into()),
+            Language::Sql | Language::Dbt => Ok(tree_sitter_sequel::LANGUAGE.into()),
             _ => Err(anyhow!("Language {} does not support tree-sitter", language.name())),
         }
     }
@@ -90,6 +91,8 @@ impl GrammarManager {
             Language::Ruby,
             Language::Php,
             Language::Shell,
+            Language::Sql,
+            Language::Dbt,
         ]
     }
 

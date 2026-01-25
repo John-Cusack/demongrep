@@ -39,8 +39,15 @@ impl SemanticChunker {
         path: &Path,
         content: &str,
     ) -> Result<Vec<Chunk>> {
-        // 1. Check if we have an extractor for this language
-        let extractor = match get_extractor(language) {
+        // 1. Detect if SQL file is actually dbt (contains Jinja templating)
+        let effective_language = if language == Language::Sql && Language::detect_dbt_from_content(content) {
+            Language::Dbt
+        } else {
+            language
+        };
+
+        // 2. Check if we have an extractor for this language
+        let extractor = match get_extractor(effective_language) {
             Some(ext) => ext,
             None => {
                 // Fall back to simple chunking for unsupported languages
@@ -48,10 +55,10 @@ impl SemanticChunker {
             }
         };
 
-        // 2. Parse the code
-        let parsed = self.parser.parse(language, content)?;
+        // 3. Parse the code (use effective_language for proper grammar)
+        let parsed = self.parser.parse(effective_language, content)?;
 
-        // 3. Visit AST and extract chunks
+        // 4. Visit AST and extract chunks
         let mut definition_chunks = Vec::new();
         let mut gap_tracker = GapTracker::new(content);
 
@@ -65,19 +72,19 @@ impl SemanticChunker {
             &mut gap_tracker,
         );
 
-        // 4. Extract gap chunks (code between definitions)
+        // 5. Extract gap chunks (code between definitions)
         let gap_chunks = gap_tracker.extract_gaps(path);
 
-        // 5. Combine and sort all chunks by position
+        // 6. Combine and sort all chunks by position
         let mut all_chunks = definition_chunks;
         all_chunks.extend(gap_chunks);
         all_chunks.sort_by_key(|c| c.start_line);
 
-        // 6. Populate context windows (lines before/after each chunk)
+        // 7. Populate context windows (lines before/after each chunk)
         let source_lines: Vec<&str> = content.lines().collect();
         self.populate_context_windows(&mut all_chunks, &source_lines);
 
-        // 7. Split oversized chunks
+        // 8. Split oversized chunks
         let final_chunks = all_chunks
             .into_iter()
             .flat_map(|c| self.split_if_needed(c))
@@ -594,5 +601,417 @@ impl MyStruct {
             assert!(chunk.context.len() >= 2, "Should have nested context");
             assert!(chunk.context[0].contains("File:"));
         }
+    }
+}
+
+#[test]
+fn test_chunk_dbt_model() {
+    let dbt_content = r#"{{ config(
+    materialized='incremental',
+    unique_key='id',
+    schema='analytics'
+) }}
+
+-- This model aggregates customer orders
+WITH customers AS (
+    SELECT *
+    FROM {{ ref('stg_customers') }}
+    WHERE is_active = true
+),
+
+orders AS (
+    SELECT *
+    FROM {{ ref('stg_orders') }}
+    WHERE order_date >= '2024-01-01'
+),
+
+payments AS (
+    SELECT *
+    FROM {{ source('stripe', 'payments') }}
+)
+
+SELECT
+    c.customer_id,
+    c.customer_name,
+    COUNT(DISTINCT o.order_id) as total_orders,
+    SUM(p.amount) as total_spent
+FROM customers c
+LEFT JOIN orders o ON c.customer_id = o.customer_id
+LEFT JOIN payments p ON o.order_id = p.order_id
+GROUP BY 1, 2
+"#;
+
+    // Verify it's detected as dbt
+    assert!(Language::detect_dbt_from_content(dbt_content), "Should be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("models/customer_orders.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, dbt_content).unwrap();
+    
+    println!("\n=== DBT Chunking Test Results ===");
+    println!("Number of chunks: {}", chunks.len());
+    
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("\n--- Chunk {} ---", i + 1);
+        println!("Kind: {:?}", chunk.kind);
+        println!("Lines: {}-{}", chunk.start_line, chunk.end_line);
+        if let Some(sig) = &chunk.signature {
+            println!("Signature: {}", sig);
+        }
+        if let Some(doc) = &chunk.docstring {
+            println!("Docstring: {}", doc);
+        }
+        println!("Content (first 200 chars):\n{}", 
+            chunk.content.chars().take(200).collect::<String>());
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce at least one chunk");
+}
+
+#[test]
+fn test_chunk_dbt_macro() {
+    let dbt_macro = r#"{% macro generate_schema_name(custom_schema_name, node) %}
+    {%- set default_schema = target.schema -%}
+    {%- if custom_schema_name is none -%}
+        {{ default_schema }}
+    {%- else -%}
+        {{ default_schema }}_{{ custom_schema_name | trim }}
+    {%- endif -%}
+{% endmacro %}
+
+{% macro cents_to_dollars(column_name) %}
+    ({{ column_name }} / 100)::numeric(16,2)
+{% endmacro %}
+
+{% macro get_payment_methods() %}
+    {{ return(['credit_card', 'bank_transfer', 'gift_card']) }}
+{% endmacro %}
+"#;
+
+    assert!(Language::detect_dbt_from_content(dbt_macro), "Should be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("macros/utils.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, dbt_macro).unwrap();
+    
+    println!("\n=== DBT Macro Chunking Test Results ===");
+    println!("Number of chunks: {}", chunks.len());
+    
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("\n--- Chunk {} ---", i + 1);
+        println!("Kind: {:?}", chunk.kind);
+        println!("Lines: {}-{}", chunk.start_line, chunk.end_line);
+        if let Some(sig) = &chunk.signature {
+            println!("Signature: {}", sig);
+        }
+        println!("Content:\n{}", chunk.content);
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce at least one chunk");
+}
+
+#[test]
+fn test_chunk_plain_sql() {
+    let sql_content = r#"-- Create customers table
+CREATE TABLE customers (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Create orders table  
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    customer_id INT REFERENCES customers(id),
+    total DECIMAL(10,2),
+    status VARCHAR(50),
+    order_date DATE
+);
+
+-- View for active customers with orders
+CREATE VIEW active_customers AS
+SELECT 
+    c.id,
+    c.name,
+    COUNT(o.id) as order_count,
+    SUM(o.total) as total_spent
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE o.status = 'completed'
+GROUP BY c.id, c.name;
+"#;
+
+    // Verify it's NOT detected as dbt
+    assert!(!Language::detect_dbt_from_content(sql_content), "Should NOT be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("schema.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, sql_content).unwrap();
+    
+    println!("\n=== Plain SQL Chunking Test Results ===");
+    println!("Number of chunks: {}", chunks.len());
+    
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("\n--- Chunk {} ---", i + 1);
+        println!("Kind: {:?}", chunk.kind);
+        println!("Lines: {}-{}", chunk.start_line, chunk.end_line);
+        if let Some(sig) = &chunk.signature {
+            println!("Signature: {}", sig);
+        }
+        println!("Content:\n{}", chunk.content);
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce at least one chunk");
+}
+
+#[test]
+fn test_chunk_sql_with_functions() {
+    let sql_content = r#"-- Helper function to calculate tax
+CREATE FUNCTION calculate_tax(amount DECIMAL(10,2), rate DECIMAL(5,2))
+RETURNS DECIMAL(10,2)
+AS $$
+BEGIN
+    RETURN amount * rate;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Get customer total with tax
+CREATE FUNCTION get_customer_total(customer_id INT)
+RETURNS TABLE(subtotal DECIMAL, tax DECIMAL, total DECIMAL)
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        SUM(amount) as subtotal,
+        calculate_tax(SUM(amount), 0.08) as tax,
+        SUM(amount) + calculate_tax(SUM(amount), 0.08) as total
+    FROM orders
+    WHERE customer_id = customer_id;
+END;
+$$ LANGUAGE plpgsql;
+"#;
+
+    assert!(!Language::detect_dbt_from_content(sql_content), "Should NOT be dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("functions.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, sql_content).unwrap();
+    
+    println!("\n=== SQL Functions Test ===");
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Chunk {}: {:?} - {:?}", i + 1, chunk.kind, chunk.signature);
+    }
+    
+    // Should have function chunks
+    let function_chunks: Vec<_> = chunks.iter()
+        .filter(|c| c.kind == ChunkKind::Function)
+        .collect();
+    
+    assert!(function_chunks.len() >= 1, "Should have at least one function chunk");
+}
+
+#[test]
+fn test_chunk_sql_with_ctes() {
+    let sql_content = r#"WITH 
+monthly_sales AS (
+    SELECT 
+        DATE_TRUNC('month', order_date) as month,
+        SUM(amount) as total_sales
+    FROM orders
+    GROUP BY 1
+),
+quarterly_sales AS (
+    SELECT 
+        DATE_TRUNC('quarter', month) as quarter,
+        SUM(total_sales) as total_sales
+    FROM monthly_sales
+    GROUP BY 1
+)
+SELECT * FROM quarterly_sales;
+"#;
+
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("report.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, sql_content).unwrap();
+    
+    println!("\n=== SQL CTEs Test ===");
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Chunk {}: {:?} lines {}-{}", i + 1, chunk.kind, chunk.start_line, chunk.end_line);
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce chunks");
+}
+
+#[test]
+fn test_chunk_dbt_snapshot() {
+    let dbt_snapshot = r#"{% snapshot orders_snapshot %}
+
+{{ config(
+    target_schema='snapshots',
+    unique_key='order_id',
+    strategy='timestamp',
+    updated_at='updated_at',
+) }}
+
+SELECT 
+    order_id,
+    customer_id,
+    status,
+    amount,
+    updated_at
+FROM {{ source('raw', 'orders') }}
+
+{% endsnapshot %}
+"#;
+
+    assert!(Language::detect_dbt_from_content(dbt_snapshot), "Should be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("snapshots/orders_snapshot.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, dbt_snapshot).unwrap();
+    
+    println!("\n=== dbt Snapshot Test ===");
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Chunk {}: {:?}", i + 1, chunk.kind);
+        if let Some(sig) = &chunk.signature {
+            println!("  Signature: {}", sig);
+        }
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce chunks");
+}
+
+#[test]
+fn test_chunk_dbt_incremental_model() {
+    let dbt_incremental = r#"{{ config(
+    materialized='incremental',
+    unique_key='event_id',
+    incremental_strategy='merge',
+    on_schema_change='sync_all_columns'
+) }}
+
+WITH source_events AS (
+    SELECT *
+    FROM {{ source('events', 'raw_events') }}
+    {% if is_incremental() %}
+    WHERE event_timestamp > (SELECT MAX(event_timestamp) FROM {{ this }})
+    {% endif %}
+),
+
+enriched AS (
+    SELECT 
+        e.*,
+        u.user_name,
+        u.user_segment
+    FROM source_events e
+    LEFT JOIN {{ ref('dim_users') }} u ON e.user_id = u.user_id
+)
+
+SELECT * FROM enriched
+"#;
+
+    assert!(Language::detect_dbt_from_content(dbt_incremental), "Should be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("models/events/fct_events.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, dbt_incremental).unwrap();
+    
+    println!("\n=== dbt Incremental Model Test ===");
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Chunk {}: {:?} lines {}-{}", i + 1, chunk.kind, chunk.start_line, chunk.end_line);
+        if let Some(sig) = &chunk.signature {
+            println!("  Signature: {}", sig);
+        }
+    }
+    
+    // Check that signature contains expected dbt metadata
+    let has_config = chunks.iter().any(|c| {
+        c.signature.as_ref().map_or(false, |s| s.contains("materialized='incremental'"))
+    });
+    
+    let has_refs = chunks.iter().any(|c| {
+        c.signature.as_ref().map_or(false, |s| s.contains("dim_users"))
+    });
+    
+    let has_sources = chunks.iter().any(|c| {
+        c.signature.as_ref().map_or(false, |s| s.contains("events.raw_events"))
+    });
+    
+    assert!(has_config || has_refs || has_sources, 
+        "Should extract dbt metadata (config, refs, or sources)");
+}
+
+#[test]
+fn test_chunk_dbt_test_file() {
+    let dbt_test = r#"{% test not_null_where(model, column_name, where_clause) %}
+
+SELECT *
+FROM {{ model }}
+WHERE {{ column_name }} IS NULL
+AND {{ where_clause }}
+
+{% endtest %}
+
+{% test accepted_range(model, column_name, min_value, max_value) %}
+
+SELECT *
+FROM {{ model }}
+WHERE {{ column_name }} < {{ min_value }}
+   OR {{ column_name }} > {{ max_value }}
+
+{% endtest %}
+"#;
+
+    assert!(Language::detect_dbt_from_content(dbt_test), "Should be detected as dbt");
+    
+    let mut chunker = SemanticChunker::new(100, 2000, 10);
+    let path = std::path::Path::new("tests/generic/custom_tests.sql");
+    
+    let chunks = chunker.chunk_semantic(Language::Sql, path, dbt_test).unwrap();
+    
+    println!("\n=== dbt Test File Test ===");
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Chunk {}: {:?}", i + 1, chunk.kind);
+    }
+    
+    assert!(!chunks.is_empty(), "Should produce chunks");
+}
+
+#[test]
+fn test_plain_sql_vs_dbt_detection() {
+    // Plain SQL - should NOT be detected as dbt
+    let plain_sql_examples = vec![
+        "SELECT * FROM users WHERE status = 'active'",
+        "CREATE TABLE orders (id INT, amount DECIMAL)",
+        "INSERT INTO logs VALUES (1, 'test', NOW())",
+        "UPDATE users SET status = 'inactive' WHERE last_login < '2024-01-01'",
+        "-- Comment with {{ curly braces }} but no dbt pattern",
+    ];
+    
+    for sql in plain_sql_examples {
+        assert!(!Language::detect_dbt_from_content(sql), 
+            "Should NOT detect as dbt: {}", sql.chars().take(50).collect::<String>());
+    }
+    
+    // dbt - SHOULD be detected
+    let dbt_examples = vec![
+        "SELECT * FROM {{ ref('users') }}",
+        "{{ config(materialized='table') }} SELECT 1",
+        "SELECT * FROM {{ source('raw', 'data') }}",
+        "{% macro test() %} SELECT 1 {% endmacro %}",
+        "{% if is_incremental() %} WHERE id > 0 {% endif %}",
+    ];
+    
+    for dbt in dbt_examples {
+        assert!(Language::detect_dbt_from_content(dbt), 
+            "SHOULD detect as dbt: {}", dbt.chars().take(50).collect::<String>());
     }
 }

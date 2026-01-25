@@ -22,6 +22,7 @@ pub enum Language {
     Yaml,
     Toml,
     Sql,
+    Dbt,
     Html,
     Css,
     Unknown,
@@ -83,7 +84,28 @@ impl Language {
                 | Self::Ruby
                 | Self::Php
                 | Self::Shell
+                | Self::Sql
+                | Self::Dbt
         )
+    }
+
+    /// Detect if SQL content is actually a dbt model (contains Jinja templating)
+    ///
+    /// dbt files use Jinja2 templating with patterns like:
+    /// - `{{ ref('model') }}` - model references
+    /// - `{{ source('schema', 'table') }}` - source references
+    /// - `{{ config(...) }}` - configuration blocks
+    /// - `{% macro name(...) %}` - macro definitions
+    pub fn detect_dbt_from_content(content: &str) -> bool {
+        // Check for common dbt/Jinja patterns
+        let has_jinja_expr = content.contains("{{") && content.contains("}}");
+        let has_jinja_stmt = content.contains("{%") && content.contains("%}");
+        let has_dbt_ref = content.contains("ref(") || content.contains("ref (");
+        let has_dbt_source = content.contains("source(") || content.contains("source (");
+        let has_dbt_config = content.contains("config(") || content.contains("config (");
+
+        // Must have Jinja syntax AND at least one dbt-specific pattern
+        (has_jinja_expr || has_jinja_stmt) && (has_dbt_ref || has_dbt_source || has_dbt_config || has_jinja_stmt)
     }
 
     /// Check if this is a text-based language (should be indexed)
@@ -113,6 +135,7 @@ impl Language {
             Self::Yaml => "YAML",
             Self::Toml => "TOML",
             Self::Sql => "SQL",
+            Self::Dbt => "dbt",
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Unknown => "Unknown",
@@ -161,5 +184,66 @@ mod tests {
         assert!(Language::Rust.is_indexable());
         assert!(Language::Markdown.is_indexable());
         assert!(!Language::Unknown.is_indexable());
+    }
+
+    #[test]
+    fn test_sql_tree_sitter_support() {
+        assert!(Language::Sql.supports_tree_sitter());
+        assert!(Language::Dbt.supports_tree_sitter());
+    }
+
+    #[test]
+    fn test_dbt_detection_with_ref() {
+        let dbt_content = r#"
+            {{ config(materialized='table') }}
+
+            SELECT *
+            FROM {{ ref('upstream_model') }}
+            WHERE status = 'active'
+        "#;
+        assert!(Language::detect_dbt_from_content(dbt_content));
+    }
+
+    #[test]
+    fn test_dbt_detection_with_source() {
+        let dbt_content = r#"
+            SELECT *
+            FROM {{ source('raw', 'customers') }}
+        "#;
+        assert!(Language::detect_dbt_from_content(dbt_content));
+    }
+
+    #[test]
+    fn test_dbt_detection_with_macro() {
+        let dbt_content = r#"
+            {% macro my_macro(arg1) %}
+                SELECT {{ arg1 }}
+            {% endmacro %}
+        "#;
+        assert!(Language::detect_dbt_from_content(dbt_content));
+    }
+
+    #[test]
+    fn test_plain_sql_not_detected_as_dbt() {
+        let sql_content = r#"
+            CREATE TABLE customers (
+                id INT PRIMARY KEY,
+                name VARCHAR(255)
+            );
+
+            SELECT * FROM customers WHERE status = 'active';
+        "#;
+        assert!(!Language::detect_dbt_from_content(sql_content));
+    }
+
+    #[test]
+    fn test_sql_with_curly_braces_not_dbt() {
+        // SQL with JSON/JSONB that has curly braces but no dbt patterns
+        let sql_content = r#"
+            SELECT data->>'name' as name
+            FROM events
+            WHERE data @> '{"type": "click"}'
+        "#;
+        assert!(!Language::detect_dbt_from_content(sql_content));
     }
 }

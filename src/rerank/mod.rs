@@ -12,8 +12,8 @@ use crate::vectordb::SearchResult;
 
 pub use neural::NeuralReranker;
 
-/// Default RRF k parameter (per osgrep reference)
-pub const DEFAULT_RRF_K: f32 = 20.0;
+/// Default RRF k parameter (research recommends k=60 for better recall)
+pub const DEFAULT_RRF_K: f32 = 60.0;
 
 /// Fused search result combining vector and FTS scores
 #[derive(Debug, Clone)]
@@ -63,6 +63,128 @@ pub fn rrf_fusion(
     for (rank, result) in fts_results.iter().enumerate() {
         let chunk_id = result.chunk_id;
         let rrf_score = 1.0 / (k + rank as f32 + 1.0);
+
+        let entry = scores.entry(chunk_id).or_insert((0.0, None, None, None, None));
+        entry.0 += rrf_score;
+        entry.2 = Some(result.score);
+        entry.4 = Some(rank + 1);
+    }
+
+    // Convert to FusedResult and sort by RRF score
+    let mut results: Vec<FusedResult> = scores
+        .into_iter()
+        .map(|(chunk_id, (rrf_score, vector_score, fts_score, vector_rank, fts_rank))| {
+            FusedResult {
+                chunk_id,
+                rrf_score,
+                vector_score,
+                fts_score,
+                vector_rank,
+                fts_rank,
+            }
+        })
+        .collect();
+
+    // Sort by RRF score descending
+    results.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    results
+}
+
+/// Query types for adaptive weighting
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QueryType {
+    /// Single identifier or code-like token (e.g., "HashMap", "process_payment")
+    Keyword,
+    /// Natural language question (e.g., "how do I authenticate users")
+    Semantic,
+    /// Mixed query with both code and natural language
+    Hybrid,
+}
+
+/// Classify query type based on heuristics
+pub fn classify_query(query: &str) -> QueryType {
+    let query_lower = query.to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().collect();
+
+    // Single word or very short = likely keyword search
+    if words.len() == 1 {
+        return QueryType::Keyword;
+    }
+
+    // Contains question words = semantic
+    let semantic_markers = ["how", "what", "where", "why", "when", "which", "can", "does", "is", "are", "should", "could", "would"];
+    if words.iter().any(|w| semantic_markers.contains(&w.to_lowercase().as_str())) {
+        return QueryType::Semantic;
+    }
+
+    // Contains code-like tokens = keyword-leaning
+    if query.contains("::") || query.contains("()") || query.contains("->") || query.contains("=>") {
+        return QueryType::Keyword;
+    }
+
+    // CamelCase or snake_case patterns suggest keyword
+    let has_camel_case = query.chars().any(|c| c.is_uppercase()) &&
+                         query.chars().any(|c| c.is_lowercase()) &&
+                         !query.contains(' ');
+    let has_snake_case = query.contains('_') && !query.contains(' ');
+
+    if has_camel_case || has_snake_case {
+        return QueryType::Keyword;
+    }
+
+    // Short phrases (2-3 words) without semantic markers lean toward hybrid
+    if words.len() <= 3 {
+        return QueryType::Hybrid;
+    }
+
+    // Longer natural language phrases = semantic
+    if words.len() >= 5 {
+        return QueryType::Semantic;
+    }
+
+    QueryType::Hybrid
+}
+
+/// Get alpha weight for vector results based on query type
+/// Alpha = weight for vector search (1 - alpha = weight for FTS)
+pub fn query_alpha(query_type: QueryType) -> f32 {
+    match query_type {
+        QueryType::Keyword => 0.3,   // 30% vector, 70% FTS (favor exact matching)
+        QueryType::Semantic => 0.8,  // 80% vector, 20% FTS (favor semantic similarity)
+        QueryType::Hybrid => 0.5,    // 50% each (balanced)
+    }
+}
+
+/// Reciprocal Rank Fusion with query-dependent weighting
+///
+/// This version applies alpha weighting to balance vector and FTS contributions
+/// based on query type classification.
+pub fn weighted_rrf_fusion(
+    vector_results: &[SearchResult],
+    fts_results: &[FtsResult],
+    k: f32,
+    alpha: f32,
+) -> Vec<FusedResult> {
+    // Maps chunk_id -> (rrf_score, vector_score, fts_score, vector_rank, fts_rank)
+    let mut scores: HashMap<u32, (f32, Option<f32>, Option<f32>, Option<usize>, Option<usize>)> =
+        HashMap::new();
+
+    // Process vector results with alpha weight
+    for (rank, result) in vector_results.iter().enumerate() {
+        let chunk_id = result.id;
+        let rrf_score = alpha * (1.0 / (k + rank as f32 + 1.0));
+
+        let entry = scores.entry(chunk_id).or_insert((0.0, None, None, None, None));
+        entry.0 += rrf_score;
+        entry.1 = Some(result.score);
+        entry.3 = Some(rank + 1);
+    }
+
+    // Process FTS results with (1 - alpha) weight
+    for (rank, result) in fts_results.iter().enumerate() {
+        let chunk_id = result.chunk_id;
+        let rrf_score = (1.0 - alpha) * (1.0 / (k + rank as f32 + 1.0));
 
         let entry = scores.entry(chunk_id).or_insert((0.0, None, None, None, None));
         entry.0 += rrf_score;
@@ -204,5 +326,105 @@ mod tests {
         assert_eq!(results[0].chunk_id, 1);
         assert_eq!(results[0].rrf_score, 0.9);
         assert!(results[0].fts_score.is_none());
+    }
+
+    #[test]
+    fn test_query_classification_keyword() {
+        // Single tokens
+        assert_eq!(classify_query("HashMap"), QueryType::Keyword);
+        assert_eq!(classify_query("processPayment"), QueryType::Keyword);
+
+        // Code-like patterns
+        assert_eq!(classify_query("std::collections::HashMap"), QueryType::Keyword);
+        assert_eq!(classify_query("process_payment"), QueryType::Keyword);
+        assert_eq!(classify_query("foo()"), QueryType::Keyword);
+        assert_eq!(classify_query("Result<T, E>"), QueryType::Keyword);
+    }
+
+    #[test]
+    fn test_query_classification_semantic() {
+        // Question patterns
+        assert_eq!(classify_query("how do I authenticate users"), QueryType::Semantic);
+        assert_eq!(classify_query("what is the best way to handle errors"), QueryType::Semantic);
+        assert_eq!(classify_query("where are database connections managed"), QueryType::Semantic);
+        assert_eq!(classify_query("why does this function return None"), QueryType::Semantic);
+
+        // Long natural language
+        assert_eq!(classify_query("find the code that processes payment transactions"), QueryType::Semantic);
+    }
+
+    #[test]
+    fn test_query_classification_hybrid() {
+        // Mixed short phrases
+        assert_eq!(classify_query("sort function"), QueryType::Hybrid);
+        assert_eq!(classify_query("authentication handler"), QueryType::Hybrid);
+        assert_eq!(classify_query("database connection pool"), QueryType::Hybrid);
+    }
+
+    #[test]
+    fn test_query_alpha_values() {
+        assert!((query_alpha(QueryType::Keyword) - 0.3).abs() < 0.001);
+        assert!((query_alpha(QueryType::Semantic) - 0.8).abs() < 0.001);
+        assert!((query_alpha(QueryType::Hybrid) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_weighted_rrf_keyword_query() {
+        // For keyword queries (alpha=0.3), FTS should dominate
+        let vector_results = vec![
+            make_vector_result(1, 0.9),  // Top in vector
+            make_vector_result(2, 0.8),
+        ];
+
+        let fts_results = vec![
+            make_fts_result(2, 10.0),  // Top in FTS
+            make_fts_result(1, 8.0),
+        ];
+
+        let alpha = 0.3;  // Keyword query
+        let fused = weighted_rrf_fusion(&vector_results, &fts_results, 60.0, alpha);
+
+        // With alpha=0.3, FTS has 70% weight, so ID 2 (top in FTS) should rank higher
+        assert_eq!(fused[0].chunk_id, 2, "FTS top result should win with low alpha");
+    }
+
+    #[test]
+    fn test_weighted_rrf_semantic_query() {
+        // For semantic queries (alpha=0.8), vector should dominate
+        let vector_results = vec![
+            make_vector_result(1, 0.9),  // Top in vector
+            make_vector_result(2, 0.8),
+        ];
+
+        let fts_results = vec![
+            make_fts_result(2, 10.0),  // Top in FTS
+            make_fts_result(1, 8.0),
+        ];
+
+        let alpha = 0.8;  // Semantic query
+        let fused = weighted_rrf_fusion(&vector_results, &fts_results, 60.0, alpha);
+
+        // With alpha=0.8, vector has 80% weight, so ID 1 (top in vector) should rank higher
+        assert_eq!(fused[0].chunk_id, 1, "Vector top result should win with high alpha");
+    }
+
+    #[test]
+    fn test_weighted_rrf_balanced() {
+        // For balanced queries (alpha=0.5), both contribute equally
+        let vector_results = vec![make_vector_result(1, 0.9)];
+        let fts_results = vec![make_fts_result(1, 10.0)];
+
+        let alpha = 0.5;
+        let fused = weighted_rrf_fusion(&vector_results, &fts_results, 60.0, alpha);
+
+        // With k=60, rank 1 contribution = 1/61
+        // Expected: 0.5 * (1/61) + 0.5 * (1/61) = 1/61
+        let expected = 1.0 / 61.0;
+        assert!((fused[0].rrf_score - expected).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_default_rrf_k_is_60() {
+        assert_eq!(DEFAULT_RRF_K, 60.0);
     }
 }

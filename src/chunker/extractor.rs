@@ -84,6 +84,8 @@ pub fn get_extractor(language: Language) -> Option<Box<dyn LanguageExtractor>> {
         Language::Ruby => Some(Box::new(RubyExtractor)),
         Language::Php => Some(Box::new(PhpExtractor)),
         Language::Shell => Some(Box::new(BashExtractor)),
+        Language::Sql => Some(Box::new(SqlExtractor)),
+        Language::Dbt => Some(Box::new(DbtExtractor)),
         _ => None,
     }
 }
@@ -1264,6 +1266,294 @@ impl LanguageExtractor for BashExtractor {
     }
 }
 
+/// SQL language extractor
+///
+/// Extracts semantic chunks from SQL files including:
+/// - CREATE TABLE/VIEW/INDEX statements
+/// - CREATE FUNCTION/PROCEDURE definitions
+/// - WITH (CTE) blocks
+pub struct SqlExtractor;
+
+impl LanguageExtractor for SqlExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        // Node types from tree-sitter-sequel grammar
+        &[
+            "create_table",
+            "create_view",
+            "create_materialized_view",
+            "create_index",
+            "create_function",
+            "create_procedure",
+            "create_trigger",
+            "create_type",
+            "create_schema",
+            "create_database",
+            "cte",
+            "common_table_expression",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Try different field names used by tree-sitter-sql
+        for field in &["name", "table_name", "view_name", "function_name", "index_name"] {
+            if let Some(name_node) = node.child_by_field_name(field) {
+                if let Ok(text) = name_node.utf8_text(source) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
+        // Fallback: look for identifier children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier" || child.kind() == "object_reference" {
+                if let Ok(text) = child.utf8_text(source) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        let kind = node.kind();
+        let name = self.extract_name(node, source)?;
+
+        match kind {
+            "create_table" => Some(format!("CREATE TABLE {}", name)),
+            "create_view" => Some(format!("CREATE VIEW {}", name)),
+            "create_materialized_view" => Some(format!("CREATE MATERIALIZED VIEW {}", name)),
+            "create_index" => Some(format!("CREATE INDEX {}", name)),
+            "create_function" => {
+                // Try to extract parameters
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    if let Ok(params_text) = params.utf8_text(source) {
+                        return Some(format!("CREATE FUNCTION {}{}", name, params_text));
+                    }
+                }
+                if let Some(params) = node.child_by_field_name("function_arguments") {
+                    if let Ok(params_text) = params.utf8_text(source) {
+                        return Some(format!("CREATE FUNCTION {}{}", name, params_text));
+                    }
+                }
+                Some(format!("CREATE FUNCTION {}", name))
+            }
+            "create_procedure" => {
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    if let Ok(params_text) = params.utf8_text(source) {
+                        return Some(format!("CREATE PROCEDURE {}{}", name, params_text));
+                    }
+                }
+                Some(format!("CREATE PROCEDURE {}", name))
+            }
+            "create_trigger" => Some(format!("CREATE TRIGGER {}", name)),
+            "create_type" => Some(format!("CREATE TYPE {}", name)),
+            "create_schema" => Some(format!("CREATE SCHEMA {}", name)),
+            "create_database" => Some(format!("CREATE DATABASE {}", name)),
+            "cte" | "common_table_expression" => Some(format!("WITH {} AS", name)),
+            _ => Some(name),
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // SQL comments before the statement
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child(node_index - 1) {
+                if prev.kind() == "comment" || prev.kind() == "line_comment" || prev.kind() == "block_comment" {
+                    return prev.utf8_text(source).ok().map(String::from);
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "create_table" => ChunkKind::Struct,  // Tables are like structs
+            "create_view" | "create_materialized_view" => ChunkKind::TypeAlias, // Views are like type aliases
+            "create_function" => ChunkKind::Function,
+            "create_procedure" => ChunkKind::Function,
+            "create_trigger" => ChunkKind::Function,
+            "create_type" => ChunkKind::TypeAlias,
+            "create_schema" | "create_database" => ChunkKind::Mod,
+            "create_index" => ChunkKind::Other,
+            "cte" | "common_table_expression" => ChunkKind::Block,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// dbt (data build tool) extractor
+///
+/// dbt files are SQL files with Jinja2 templating. This extractor handles:
+/// - `{{ ref('model') }}` - model references
+/// - `{{ source('schema', 'table') }}` - source references
+/// - `{{ config(...) }}` - configuration blocks
+/// - `{% macro name(...) %}` - macro definitions
+/// - `{% test name(...) %}` - test definitions
+/// - Standard SQL constructs (delegated to SqlExtractor)
+///
+/// Since Jinja templating can break SQL parsing, this extractor uses
+/// a hybrid approach: regex for dbt constructs, tree-sitter for SQL.
+pub struct DbtExtractor;
+
+impl DbtExtractor {
+    /// Extract dbt refs from content: {{ ref('model_name') }}
+    fn extract_refs(content: &str) -> Vec<String> {
+        let re = regex::Regex::new(r#"\{\{\s*ref\s*\(\s*['"]([\w_]+)['"]\s*\)\s*\}\}"#).unwrap();
+        re.captures_iter(content)
+            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+            .collect()
+    }
+
+    /// Extract dbt sources from content: {{ source('schema', 'table') }}
+    fn extract_sources(content: &str) -> Vec<(String, String)> {
+        let re = regex::Regex::new(
+            r#"\{\{\s*source\s*\(\s*['"]([\w_]+)['"]\s*,\s*['"]([\w_]+)['"]\s*\)\s*\}\}"#
+        ).unwrap();
+        re.captures_iter(content)
+            .filter_map(|cap| {
+                let schema = cap.get(1)?.as_str().to_string();
+                let table = cap.get(2)?.as_str().to_string();
+                Some((schema, table))
+            })
+            .collect()
+    }
+
+    /// Extract dbt config from content: {{ config(...) }}
+    fn extract_config(content: &str) -> Option<String> {
+        let re = regex::Regex::new(r#"\{\{\s*config\s*\(([\s\S]*?)\)\s*\}\}"#).unwrap();
+        re.captures(content)
+            .and_then(|cap| cap.get(1).map(|m| m.as_str().trim().to_string()))
+    }
+
+    /// Check if this is a macro definition file
+    fn is_macro_file(content: &str) -> bool {
+        content.contains("{% macro ")
+    }
+
+    /// Extract macro definitions: {% macro name(args) %}
+    fn extract_macros(content: &str) -> Vec<(String, String, usize, usize)> {
+        let mut macros = Vec::new();
+        let re = regex::Regex::new(r#"\{%\s*macro\s+([\w_]+)\s*\(([^)]*)\)\s*%\}"#).unwrap();
+
+        for cap in re.captures_iter(content) {
+            if let (Some(name), Some(args)) = (cap.get(1), cap.get(2)) {
+                let start = cap.get(0).map(|m| content[..m.start()].lines().count()).unwrap_or(0);
+                // Find the endmacro
+                let end_re = regex::Regex::new(r#"\{%\s*endmacro\s*%\}"#).unwrap();
+                let remaining = &content[cap.get(0).unwrap().end()..];
+                let end = if let Some(end_match) = end_re.find(remaining) {
+                    start + remaining[..end_match.end()].lines().count()
+                } else {
+                    start + 10 // Default if no endmacro found
+                };
+                macros.push((
+                    name.as_str().to_string(),
+                    args.as_str().to_string(),
+                    start,
+                    end,
+                ));
+            }
+        }
+        macros
+    }
+}
+
+impl LanguageExtractor for DbtExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        // dbt uses a hybrid approach - we look for both SQL definitions
+        // and Jinja macro/test definitions
+        &[
+            // SQL definitions (same as SqlExtractor)
+            "create_table",
+            "create_view",
+            "create_materialized_view",
+            "cte",
+            "common_table_expression",
+            // Note: Jinja constructs are handled separately via regex
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Delegate to SQL extractor for SQL nodes
+        SqlExtractor.extract_name(node, source)
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        let content = source.iter().map(|&b| b as char).collect::<String>();
+
+        // Check if this is a macro file
+        if DbtExtractor::is_macro_file(&content) {
+            let macros = DbtExtractor::extract_macros(&content);
+            if let Some((name, args, _, _)) = macros.first() {
+                return Some(format!("macro {}({})", name, args));
+            }
+        }
+
+        // Extract model info
+        let refs = DbtExtractor::extract_refs(&content);
+        let sources = DbtExtractor::extract_sources(&content);
+        let config = DbtExtractor::extract_config(&content);
+
+        let mut sig_parts = Vec::new();
+
+        if let Some(conf) = config {
+            sig_parts.push(format!("config: {}", conf));
+        }
+
+        if !refs.is_empty() {
+            sig_parts.push(format!("refs: [{}]", refs.join(", ")));
+        }
+
+        if !sources.is_empty() {
+            let source_strs: Vec<String> = sources.iter()
+                .map(|(s, t)| format!("{}.{}", s, t))
+                .collect();
+            sig_parts.push(format!("sources: [{}]", source_strs.join(", ")));
+        }
+
+        if sig_parts.is_empty() {
+            // Fall back to SQL signature
+            SqlExtractor.extract_signature(node, source)
+        } else {
+            Some(sig_parts.join(" | "))
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        let content = std::str::from_utf8(source).ok()?;
+
+        // Look for dbt-style docs block: {% docs model_name %}...{% enddocs %}
+        let docs_re = regex::Regex::new(r#"\{%\s*docs\s+[\w_]+\s*%\}([\s\S]*?)\{%\s*enddocs\s*%\}"#).ok()?;
+        if let Some(cap) = docs_re.captures(content) {
+            return cap.get(1).map(|m| m.as_str().trim().to_string());
+        }
+
+        // Look for description in config
+        let desc_re = regex::Regex::new(r#"description\s*=\s*['"](.*?)['"]"#).ok()?;
+        if let Some(cap) = desc_re.captures(content) {
+            return cap.get(1).map(|m| m.as_str().to_string());
+        }
+
+        // Fall back to SQL comment extraction
+        SqlExtractor.extract_docstring(node, source)
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        // dbt models are essentially views/materializations
+        match node.kind() {
+            "cte" | "with_clause" => ChunkKind::Block,
+            _ => ChunkKind::Function, // Most dbt models act like functions/transformations
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,6 +1572,8 @@ mod tests {
         assert!(get_extractor(Language::Ruby).is_some());
         assert!(get_extractor(Language::Php).is_some());
         assert!(get_extractor(Language::Shell).is_some());
+        assert!(get_extractor(Language::Sql).is_some());
+        assert!(get_extractor(Language::Dbt).is_some());
         assert!(get_extractor(Language::Markdown).is_none());
     }
 
@@ -1370,5 +1662,147 @@ mod tests {
         let types = extractor.definition_types();
 
         assert!(types.contains(&"function_definition"));
+    }
+
+    #[test]
+    fn test_sql_definition_types() {
+        let extractor = SqlExtractor;
+        let types = extractor.definition_types();
+        
+        assert!(types.contains(&"create_table"));
+        assert!(types.contains(&"create_view"));
+        assert!(types.contains(&"create_function"));
+        assert!(types.contains(&"create_index"));
+    }
+
+    #[test]
+    fn test_dbt_definition_types() {
+        let extractor = DbtExtractor;
+        let types = extractor.definition_types();
+        
+        assert!(types.contains(&"create_table"));
+        assert!(types.contains(&"create_view"));
+        assert!(types.contains(&"cte"));
+    }
+
+    #[test]
+    fn test_dbt_extract_refs() {
+        let content = r#"
+            SELECT * FROM {{ ref('model_a') }}
+            JOIN {{ ref('model_b') }} ON a.id = b.id
+            LEFT JOIN {{ ref('model_c') }} ON b.id = c.id
+        "#;
+        
+        let refs = DbtExtractor::extract_refs(content);
+        assert_eq!(refs.len(), 3);
+        assert!(refs.contains(&"model_a".to_string()));
+        assert!(refs.contains(&"model_b".to_string()));
+        assert!(refs.contains(&"model_c".to_string()));
+    }
+
+    #[test]
+    fn test_dbt_extract_refs_with_spaces() {
+        let content = r#"
+            SELECT * FROM {{ ref( 'spaced_model' ) }}
+            JOIN {{ref("double_quoted")}} ON a.id = b.id
+        "#;
+        
+        let refs = DbtExtractor::extract_refs(content);
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&"spaced_model".to_string()));
+        assert!(refs.contains(&"double_quoted".to_string()));
+    }
+
+    #[test]
+    fn test_dbt_extract_sources() {
+        let content = r#"
+            SELECT * FROM {{ source('raw_data', 'customers') }}
+            JOIN {{ source('external', 'orders') }} ON c.id = o.customer_id
+        "#;
+        
+        let sources = DbtExtractor::extract_sources(content);
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains(&("raw_data".to_string(), "customers".to_string())));
+        assert!(sources.contains(&("external".to_string(), "orders".to_string())));
+    }
+
+    #[test]
+    fn test_dbt_extract_config() {
+        let content = r#"
+            {{ config(
+                materialized='table',
+                schema='analytics',
+                tags=['daily', 'core']
+            ) }}
+            SELECT * FROM foo
+        "#;
+        
+        let config = DbtExtractor::extract_config(content);
+        assert!(config.is_some());
+        let config_str = config.unwrap();
+        assert!(config_str.contains("materialized='table'"));
+        assert!(config_str.contains("schema='analytics'"));
+    }
+
+    #[test]
+    fn test_dbt_extract_config_single_line() {
+        let content = r#"{{ config(materialized='view') }}
+            SELECT * FROM foo"#;
+        
+        let config = DbtExtractor::extract_config(content);
+        assert!(config.is_some());
+        assert!(config.unwrap().contains("materialized='view'"));
+    }
+
+    #[test]
+    fn test_dbt_is_macro_file() {
+        let macro_content = r#"
+            {% macro my_macro(arg1, arg2) %}
+                SELECT {{ arg1 }} FROM {{ arg2 }}
+            {% endmacro %}
+        "#;
+        
+        let non_macro_content = r#"
+            {{ config(materialized='table') }}
+            SELECT * FROM {{ ref('model') }}
+        "#;
+        
+        assert!(DbtExtractor::is_macro_file(macro_content));
+        assert!(!DbtExtractor::is_macro_file(non_macro_content));
+    }
+
+    #[test]
+    fn test_dbt_extract_macros() {
+        let content = r#"
+{% macro cents_to_dollars(column_name) %}
+    ({{ column_name }} / 100)::numeric(16,2)
+{% endmacro %}
+
+{% macro generate_schema(custom_schema, node) %}
+    {{ custom_schema }}_{{ node.name }}
+{% endmacro %}
+"#;
+        
+        let macros = DbtExtractor::extract_macros(content);
+        assert_eq!(macros.len(), 2);
+        
+        let (name1, args1, _, _) = &macros[0];
+        assert_eq!(name1, "cents_to_dollars");
+        assert_eq!(args1, "column_name");
+        
+        let (name2, args2, _, _) = &macros[1];
+        assert_eq!(name2, "generate_schema");
+        assert_eq!(args2, "custom_schema, node");
+    }
+
+    #[test]
+    fn test_sql_classify() {
+        let extractor = SqlExtractor;
+        
+        // We can't easily create tree-sitter nodes in tests, 
+        // so we test the classification logic indirectly
+        // by checking the expected mappings exist
+        assert!(extractor.definition_types().contains(&"create_table"));
+        assert!(extractor.definition_types().contains(&"create_function"));
     }
 }

@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::embed::{ModelType, ExecutionProviderType};
+use crate::config::Config;
+use crate::embed::{ExecutionProviderType, ModelType};
 
 /// Fast, local semantic code search powered by Rust
 #[derive(Parser, Debug)]
@@ -79,8 +80,8 @@ pub enum Commands {
         #[arg(long)]
         vector_only: bool,
 
-        /// RRF k parameter for score fusion (default 20)
-        #[arg(long, default_value = "20")]
+        /// RRF k parameter for score fusion (default 60, research-recommended)
+        #[arg(long, default_value = "60")]
         rrf_k: f32,
 
         /// Enable neural reranking for better accuracy (uses Jina Reranker)
@@ -96,12 +97,13 @@ pub enum Commands {
         filter_path: Option<String>,
 
         /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "cpu")]
-        provider: String,
+        /// If not specified, uses config file or defaults to cpu
+        #[arg(long)]
+        provider: Option<String>,
 
         /// GPU device ID to use (for CUDA/TensorRT)
-        #[arg(long, default_value = "0")]
-        device_id: i32,
+        #[arg(long)]
+        device_id: Option<i32>,
     },
 
     /// Index the repository
@@ -122,12 +124,13 @@ pub enum Commands {
         global: bool,
 
         /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "cpu")]
-        provider: String,
+        /// If not specified, uses config file or defaults to cpu
+        #[arg(long)]
+        provider: Option<String>,
 
         /// GPU device ID to use (for CUDA/TensorRT)
-        #[arg(long, default_value = "0")]
-        device_id: i32,
+        #[arg(long)]
+        device_id: Option<i32>,
     },
 
     /// Run a background server with live file watching
@@ -140,12 +143,13 @@ pub enum Commands {
         path: Option<PathBuf>,
 
         /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "cpu")]
-        provider: String,
+        /// If not specified, uses config file or defaults to cpu
+        #[arg(long)]
+        provider: Option<String>,
 
         /// GPU device ID to use (for CUDA/TensorRT)
-        #[arg(long, default_value = "0")]
-        device_id: i32,
+        #[arg(long)]
+        device_id: Option<i32>,
     },
 
     /// List all indexed repositories
@@ -187,59 +191,98 @@ pub enum Commands {
         path: Option<PathBuf>,
 
         /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "cpu")]
-        provider: String,
+        /// If not specified, uses config file or defaults to cpu
+        #[arg(long)]
+        provider: Option<String>,
 
         /// GPU device ID to use (for CUDA/TensorRT)
-        #[arg(long, default_value = "0")]
-        device_id: i32,
+        #[arg(long)]
+        device_id: Option<i32>,
     },
 }
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Parse model from CLI flag
-    let model_type = cli.model.as_ref().and_then(|m| ModelType::from_str(m));
-    if cli.model.is_some() && model_type.is_none() {
-        eprintln!("Unknown model: '{}'. Available models:", cli.model.as_ref().unwrap());
+    // Load config file (uses defaults if file doesn't exist)
+    let config = Config::load().unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to load config file: {}", e);
+        Config::default()
+    });
+
+    // Merge model: CLI > config > default
+    let model_str = cli.model.as_ref()
+        .or(config.embedding.model.as_ref());
+    let model_type = model_str.and_then(|m| ModelType::from_str(m));
+    if model_str.is_some() && model_type.is_none() {
+        eprintln!("Unknown model: '{}'. Available models:", model_str.unwrap());
         eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
         eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
         eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
         std::process::exit(1);
     }
 
-    // Parse provider from CLI flag
-    let provider_type = match cli.command {
-        Commands::Search { ref provider, .. } => {
-            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
-                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+    // Merge batch_size: CLI > config
+    let batch_size = cli.batch_size.or(config.embedding.batch_size);
+
+    // Helper to get provider string from command or config
+    let get_provider_str = |cli_provider: &Option<String>| -> String {
+        cli_provider.clone().unwrap_or_else(|| config.embedding.provider.clone())
+    };
+
+    // Helper to get device_id from command or config
+    let get_device_id = |cli_device: Option<i32>| -> i32 {
+        cli_device.unwrap_or(config.embedding.device_id)
+    };
+
+    // Parse provider from CLI or config
+    let (provider_type, device_id) = match &cli.command {
+        Commands::Search { provider, device_id, .. } => {
+            let provider_str = get_provider_str(provider);
+            let dev_id = get_device_id(*device_id);
+            let ptype = provider_str.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider_str);
                 eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
-            })
+            });
+            (ptype, dev_id)
         }
-        Commands::Index { ref provider, .. } => {
-            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
-                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+        Commands::Index { provider, device_id, .. } => {
+            let provider_str = get_provider_str(provider);
+            let dev_id = get_device_id(*device_id);
+            let ptype = provider_str.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider_str);
                 eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
-            })
+            });
+            (ptype, dev_id)
         }
-        Commands::Serve { ref provider, .. } => {
-            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
-                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+        Commands::Serve { provider, device_id, .. } => {
+            let provider_str = get_provider_str(provider);
+            let dev_id = get_device_id(*device_id);
+            let ptype = provider_str.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider_str);
                 eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
-            })
+            });
+            (ptype, dev_id)
         }
-        Commands::Mcp { ref provider, .. } => {
-            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
-                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+        Commands::Mcp { provider, device_id, .. } => {
+            let provider_str = get_provider_str(provider);
+            let dev_id = get_device_id(*device_id);
+            let ptype = provider_str.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider_str);
                 eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
-            })
+            });
+            (ptype, dev_id)
         }
-        _ => ExecutionProviderType::Cpu,
+        _ => {
+            // For commands that don't use embedding (Doctor, Setup, etc.)
+            let provider_str = config.embedding.provider.clone();
+            let ptype = provider_str.parse::<ExecutionProviderType>().unwrap_or(ExecutionProviderType::Cpu);
+            (ptype, config.embedding.device_id)
+        }
     };
 
     // Set quiet mode if requested
@@ -264,7 +307,7 @@ pub async fn run() -> Result<()> {
             rerank_top,
             filter_path,
             provider: _,
-            device_id,
+            device_id: _,
         } => {
             // Auto-enable quiet mode for JSON output
             if json {
@@ -288,7 +331,7 @@ pub async fn run() -> Result<()> {
                 rerank_top,
                 provider_type,
                 Some(device_id),
-                cli.batch_size,
+                batch_size,
             )
             .await
         }
@@ -298,18 +341,18 @@ pub async fn run() -> Result<()> {
             force,
             global,
             provider: _,
-            device_id,
-        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), cli.batch_size).await,
-        Commands::Serve { port, path, provider: _, device_id } => {
-            crate::server::serve(port, path, provider_type, Some(device_id), cli.batch_size).await
+            device_id: _,
+        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), batch_size).await,
+        Commands::Serve { port, path, provider: _, device_id: _ } => {
+            crate::server::serve(port, path, provider_type, Some(device_id), batch_size).await
         }
         Commands::List => crate::index::list().await,
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Clear { path, yes, project } => crate::index::clear(path, yes, project).await,
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path, provider: _, device_id } => {
-            crate::mcp::run_mcp_server(path, provider_type, Some(device_id), cli.batch_size).await
+        Commands::Mcp { path, provider: _, device_id: _ } => {
+            crate::mcp::run_mcp_server(path, provider_type, Some(device_id), batch_size).await
         }
     }
 }

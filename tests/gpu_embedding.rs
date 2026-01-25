@@ -6,6 +6,22 @@
 use demongrep::embed::{detect_best_provider, ExecutionProviderType, FastEmbedder, ModelType, EmbeddingService};
 
 // ============================================================================
+// Default Behavior Tests
+// ============================================================================
+
+#[test]
+fn test_cpu_is_default_provider() {
+    // Ensure CPU is the default provider for backward compatibility
+    assert_eq!(ExecutionProviderType::default(), ExecutionProviderType::Cpu);
+}
+
+#[test]
+fn test_default_provider_is_not_auto() {
+    // Auto should NOT be the default - users must opt-in to GPU
+    assert_ne!(ExecutionProviderType::default(), ExecutionProviderType::Auto);
+}
+
+// ============================================================================
 // ExecutionProviderType Tests
 // ============================================================================
 

@@ -1,3 +1,4 @@
+use crate::embed::tuning::DEFAULT_BATCH_SIZE;
 use crate::info_print;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
@@ -80,46 +81,12 @@ impl ExecutionProviderType {
         }
     }
 
-    /// Get optimal batch size for this provider based on model dimensions
-    /// GPU providers benefit from larger batches, CPU uses smaller batches
-    pub fn optimal_batch_size(&self, dimensions: usize) -> usize {
-        match self {
-            Self::Cpu => match dimensions {
-                d if d <= 384 => 256,
-                d if d <= 768 => 128,
-                _ => 64,
-            },
-            #[cfg(feature = "cuda")]
-            Self::Cuda { .. } => match dimensions {
-                d if d <= 384 => 1024,
-                d if d <= 768 => 512,
-                _ => 256,
-            },
-            #[cfg(feature = "tensorrt")]
-            Self::TensorRt { .. } => match dimensions {
-                d if d <= 384 => 1024,
-                d if d <= 768 => 512,
-                _ => 256,
-            },
-            #[cfg(feature = "coreml")]
-            Self::CoreMl => match dimensions {
-                d if d <= 384 => 512,
-                d if d <= 768 => 256,
-                _ => 128,
-            },
-            #[cfg(feature = "directml")]
-            Self::DirectMl { .. } => match dimensions {
-                d if d <= 384 => 512,
-                d if d <= 768 => 256,
-                _ => 128,
-            },
-            Self::Auto => match dimensions {
-                // Auto assumes GPU-optimized sizes since it will pick the best available
-                d if d <= 384 => 1024,
-                d if d <= 768 => 512,
-                _ => 256,
-            },
-        }
+    /// Get optimal batch size for embedding
+    ///
+    /// Based on benchmarks, batch_size=32 is optimal for all providers.
+    /// Users can override via config file if they want to experiment.
+    pub fn optimal_batch_size(&self, _dimensions: usize) -> usize {
+        DEFAULT_BATCH_SIZE
     }
 
     /// Get provider name for display
@@ -488,10 +455,7 @@ impl FastEmbedder {
         .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
         info_print!("✅ Model loaded successfully!");
-        info_print!(
-            "   Optimal batch size: {}",
-            final_provider.optimal_batch_size(model_type.dimensions())
-        );
+        info_print!("   Default batch size: {}", DEFAULT_BATCH_SIZE);
 
         Ok(Self {
             model,
@@ -500,19 +464,15 @@ impl FastEmbedder {
         })
     }
 
-    /// Embed a batch of texts (processes in mini-batches to avoid OOM)
-    /// Uses provider-specific optimal batch size
+    /// Embed a batch of texts (processes in mini-batches)
+    /// Uses default batch size of 32 (empirically optimal)
     /// Can be overridden with DEMONGREP_BATCH_SIZE environment variable
     pub fn embed_batch(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         // Check for env var override (tune with DEMONGREP_BATCH_SIZE=N)
         let batch_size = if let Ok(env_size) = std::env::var("DEMONGREP_BATCH_SIZE") {
-            env_size.parse().unwrap_or(256)
+            env_size.parse().unwrap_or(DEFAULT_BATCH_SIZE)
         } else {
-            // Use provider-specific optimal batch size
-            // GPU providers (CUDA, TensorRT) benefit from larger batches (256-1024)
-            // CPU providers use smaller batches (64-256)
-            self.provider
-                .optimal_batch_size(self.model_type.dimensions())
+            DEFAULT_BATCH_SIZE
         };
         self.embed_batch_chunked(texts, batch_size)
     }
@@ -571,6 +531,11 @@ impl FastEmbedder {
     /// Get the execution provider
     pub fn provider(&self) -> ExecutionProviderType {
         self.provider
+    }
+
+    /// Get the default batch size
+    pub fn batch_size(&self) -> usize {
+        DEFAULT_BATCH_SIZE
     }
 }
 
@@ -735,6 +700,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(embedder.provider(), ExecutionProviderType::Cpu);
+    }
+
+    #[test]
+    #[ignore] // Requires model download
+    fn test_embedder_batch_size() {
+        let embedder = FastEmbedder::with_model_and_provider(
+            ModelType::AllMiniLML6V2Q,
+            ExecutionProviderType::Cpu,
+            None,
+        )
+        .unwrap();
+
+        // Verify batch size is the empirically-determined optimal value
+        let batch = embedder.batch_size();
+        assert_eq!(batch, 32, "Batch size should be 32 (empirically optimal)");
     }
 
     #[test]
