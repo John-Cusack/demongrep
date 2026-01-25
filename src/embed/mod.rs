@@ -50,13 +50,10 @@ impl EmbeddingService {
         let resolved_provider = embedder.provider();
         let arc_embedder = Arc::new(Mutex::new(embedder));
 
-        // Use explicit batch_size if provided (from config), otherwise use default (32)
+        // Use explicit batch_size if provided (from config), otherwise use dynamic token budget
         let batch_embedder = match batch_size {
             Some(size) => BatchEmbedder::with_batch_size(arc_embedder, size),
-            None => {
-                let default = resolved_provider.optimal_batch_size(model_type.dimensions());
-                BatchEmbedder::with_batch_size(arc_embedder, default)
-            }
+            None => BatchEmbedder::new(arc_embedder), // Uses dynamic budget based on VRAM/RAM and model
         };
         let cached_embedder = CachedBatchEmbedder::new(batch_embedder);
 
