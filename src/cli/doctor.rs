@@ -38,7 +38,7 @@ fn check_default_model() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 fn check_cuda() {
-    use crate::embed::embedder::is_cuda_available;
+    use crate::embed::is_cuda_available;
     match is_cuda_available() {
         true => println!("✅ CUDA: Available"),
         false => println!("❌ CUDA: Not available"),
@@ -52,7 +52,7 @@ fn check_cuda() {
 
 #[cfg(feature = "tensorrt")]
 fn check_tensorrt() {
-    use crate::embed::embedder::is_tensorrt_available;
+    use crate::embed::is_tensorrt_available;
     match is_tensorrt_available() {
         true => println!("✅ TensorRT: Available"),
         false => println!("❌ TensorRT: Not available"),
@@ -66,7 +66,7 @@ fn check_tensorrt() {
 
 #[cfg(feature = "coreml")]
 fn check_coreml() {
-    use crate::embed::embedder::is_coreml_available;
+    use crate::embed::is_coreml_available;
     match is_coreml_available() {
         true => println!("✅ CoreML: Available"),
         false => println!("❌ CoreML: Not available"),
@@ -80,7 +80,7 @@ fn check_coreml() {
 
 #[cfg(feature = "directml")]
 fn check_directml() {
-    use crate::embed::embedder::is_directml_available;
+    use crate::embed::is_directml_available;
     match is_directml_available() {
         true => println!("✅ DirectML: Available"),
         false => println!("❌ DirectML: Not available"),

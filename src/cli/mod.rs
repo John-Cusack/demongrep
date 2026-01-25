@@ -95,8 +95,8 @@ pub enum Commands {
         #[arg(long)]
         filter_path: Option<String>,
 
-        /// Execution provider for embeddings (auto, cpu, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "auto")]
+        /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "cpu")]
         provider: String,
 
         /// GPU device ID to use (for CUDA/TensorRT)
@@ -121,8 +121,8 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
-        /// Execution provider for embeddings (auto, cpu, cuda, tensorrt, coreml, directml)
-        #[arg(long, default_value = "auto")]
+        /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "cpu")]
         provider: String,
 
         /// GPU device ID to use (for CUDA/TensorRT)
@@ -138,6 +138,14 @@ pub enum Commands {
 
         /// Path to serve (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "cpu")]
+        provider: String,
+
+        /// GPU device ID to use (for CUDA/TensorRT)
+        #[arg(long, default_value = "0")]
+        device_id: i32,
     },
 
     /// List all indexed repositories
@@ -177,6 +185,14 @@ pub enum Commands {
     Mcp {
         /// Path to project (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Execution provider for embeddings (cpu, auto, cuda, tensorrt, coreml, directml)
+        #[arg(long, default_value = "cpu")]
+        provider: String,
+
+        /// GPU device ID to use (for CUDA/TensorRT)
+        #[arg(long, default_value = "0")]
+        device_id: i32,
     },
 }
 
@@ -198,18 +214,32 @@ pub async fn run() -> Result<()> {
         Commands::Search { ref provider, .. } => {
             provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
                 eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
-                eprintln!("  auto, cpu, cuda, tensorrt, coreml, directml");
+                eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
             })
         }
         Commands::Index { ref provider, .. } => {
             provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
                 eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
-                eprintln!("  auto, cpu, cuda, tensorrt, coreml, directml");
+                eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
                 std::process::exit(1);
             })
         }
-        _ => ExecutionProviderType::Auto,
+        Commands::Serve { ref provider, .. } => {
+            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+                eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
+                std::process::exit(1);
+            })
+        }
+        Commands::Mcp { ref provider, .. } => {
+            provider.parse::<ExecutionProviderType>().unwrap_or_else(|_| {
+                eprintln!("Unknown execution provider: '{}'. Available providers:", provider);
+                eprintln!("  cpu, auto, cuda, tensorrt, coreml, directml");
+                std::process::exit(1);
+            })
+        }
+        _ => ExecutionProviderType::Cpu,
     };
 
     // Set quiet mode if requested
@@ -257,7 +287,7 @@ pub async fn run() -> Result<()> {
                 rerank,
                 rerank_top,
                 provider_type,
-                device_id,
+                Some(device_id),
                 cli.batch_size,
             )
             .await
@@ -269,14 +299,18 @@ pub async fn run() -> Result<()> {
             global,
             provider: _,
             device_id,
-        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, device_id, cli.batch_size).await,
-        Commands::Serve { port, path } => crate::server::serve(port, path).await,
+        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), cli.batch_size).await,
+        Commands::Serve { port, path, provider: _, device_id } => {
+            crate::server::serve(port, path, provider_type, Some(device_id), cli.batch_size).await
+        }
         Commands::List => crate::index::list().await,
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Clear { path, yes, project } => crate::index::clear(path, yes, project).await,
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path } => crate::mcp::run_mcp_server(path).await,
+        Commands::Mcp { path, provider: _, device_id } => {
+            crate::mcp::run_mcp_server(path, provider_type, Some(device_id), cli.batch_size).await
+        }
     }
 }
 

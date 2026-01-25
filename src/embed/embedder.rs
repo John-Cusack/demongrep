@@ -1,6 +1,7 @@
 use crate::info_print;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
+use std::str::FromStr;
 
 /// Execution provider for embedding inference
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,9 +19,17 @@ pub enum ExecutionProviderType {
     Auto,
 }
 
+impl FromStr for ExecutionProviderType {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str_with_device(s, 0)
+    }
+}
+
 impl ExecutionProviderType {
-    /// Parse provider from string
-    pub fn from_str(s: &str, device_id: i32) -> Result<Self, &'static str> {
+    /// Parse provider from string with device ID
+    pub fn from_str_with_device(s: &str, device_id: i32) -> Result<Self, &'static str> {
         match s.to_lowercase().as_str() {
             "cpu" => Ok(Self::Cpu),
             "cuda" => {
@@ -129,25 +138,27 @@ impl ExecutionProviderType {
         }
     }
 
-    /// Convert to fastembed execution provider dispatch
-    fn to_fastembed_provider(&self) -> fastembed::ExecutionProviderDispatch {
+    /// Convert to ort execution provider dispatch for use with fastembed
+    fn to_execution_provider_dispatch(&self) -> ort::ep::ExecutionProviderDispatch {
+        use ort::ep;
+
         match self {
-            Self::Cpu => fastembed::ExecutionProviderDispatch::Cpu,
+            Self::Cpu => ep::CPUExecutionProvider::default().build(),
             #[cfg(feature = "cuda")]
-            Self::Cuda { device_id } => fastembed::ExecutionProviderDispatch::Cuda {
-                device_id: *device_id,
-            },
+            Self::Cuda { device_id } => ep::CUDAExecutionProvider::default()
+                .with_device_id(*device_id)
+                .build(),
             #[cfg(feature = "tensorrt")]
-            Self::TensorRt { device_id } => fastembed::ExecutionProviderDispatch::TensorRt {
-                device_id: *device_id,
-            },
+            Self::TensorRt { device_id } => ep::TensorRTExecutionProvider::default()
+                .with_device_id(*device_id)
+                .build(),
             #[cfg(feature = "coreml")]
-            Self::CoreMl => fastembed::ExecutionProviderDispatch::CoreMl,
+            Self::CoreMl => ep::CoreMLExecutionProvider::default().build(),
             #[cfg(feature = "directml")]
-            Self::DirectMl { device_id } => fastembed::ExecutionProviderDispatch::DirectMl {
-                device_id: *device_id,
-            },
-            Self::Auto => fastembed::ExecutionProviderDispatch::Cpu, // Auto resolves before this
+            Self::DirectMl { device_id } => ep::DirectMLExecutionProvider::default()
+                .with_device_id(*device_id)
+                .build(),
+            Self::Auto => ep::CPUExecutionProvider::default().build(), // Auto resolves before this
         }
     }
 }
@@ -387,26 +398,26 @@ pub fn detect_best_provider() -> ExecutionProviderType {
 
 #[cfg(feature = "cuda")]
 pub fn is_cuda_available() -> bool {
-    use ort::execution_providers::CUDAExecutionProvider;
-    CUDAExecutionProvider::default().is_available()
+    use ort::ep::{ExecutionProvider, CUDA};
+    CUDA::default().is_available().unwrap_or(false)
 }
 
 #[cfg(feature = "tensorrt")]
-fn is_tensorrt_available() -> bool {
-    use ort::execution_providers::TensorRTExecutionProvider;
-    TensorRTExecutionProvider::default().is_available()
+pub fn is_tensorrt_available() -> bool {
+    use ort::ep::{ExecutionProvider, TensorRT};
+    TensorRT::default().is_available().unwrap_or(false)
 }
 
 #[cfg(feature = "coreml")]
-fn is_coreml_available() -> bool {
-    use ort::execution_providers::CoreMLExecutionProvider;
-    CoreMLExecutionProvider::default().is_available()
+pub fn is_coreml_available() -> bool {
+    use ort::ep::{ExecutionProvider, CoreML};
+    CoreML::default().is_available().unwrap_or(false)
 }
 
 #[cfg(feature = "directml")]
-fn is_directml_available() -> bool {
-    use ort::execution_providers::DirectMLExecutionProvider;
-    DirectMLExecutionProvider::default().is_available()
+pub fn is_directml_available() -> bool {
+    use ort::ep::{ExecutionProvider, DirectML};
+    DirectML::default().is_available().unwrap_or(false)
 }
 
 /// Fast embedding model using fastembed library
@@ -466,8 +477,8 @@ impl FastEmbedder {
             (p, _) => p,
         };
 
-        let fastembed_provider = final_provider.to_fastembed_provider();
-        let execution_providers = vec![fastembed_provider];
+        let ep_dispatch = final_provider.to_execution_provider_dispatch();
+        let execution_providers = vec![ep_dispatch];
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())
@@ -647,18 +658,30 @@ mod tests {
     #[test]
     fn test_execution_provider_from_str() {
         assert_eq!(
-            ExecutionProviderType::from_str("cpu", 0).unwrap(),
+            "cpu".parse::<ExecutionProviderType>().unwrap(),
             ExecutionProviderType::Cpu
         );
         assert_eq!(
-            ExecutionProviderType::from_str("auto", 0).unwrap(),
+            "auto".parse::<ExecutionProviderType>().unwrap(),
             ExecutionProviderType::Auto
         );
         assert_eq!(
-            ExecutionProviderType::from_str("CPU", 0).unwrap(),
+            "CPU".parse::<ExecutionProviderType>().unwrap(),
             ExecutionProviderType::Cpu
         );
-        assert!(ExecutionProviderType::from_str("invalid", 0).is_err());
+        assert!("invalid".parse::<ExecutionProviderType>().is_err());
+    }
+
+    #[test]
+    fn test_execution_provider_from_str_with_device() {
+        assert_eq!(
+            ExecutionProviderType::from_str_with_device("cpu", 0).unwrap(),
+            ExecutionProviderType::Cpu
+        );
+        assert_eq!(
+            ExecutionProviderType::from_str_with_device("auto", 1).unwrap(),
+            ExecutionProviderType::Auto
+        );
     }
 
     #[test]

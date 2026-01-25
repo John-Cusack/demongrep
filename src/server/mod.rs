@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingService, ExecutionProviderType, ModelType};
 use crate::file::FileWalker;
 use crate::index::get_search_db_paths;
 use crate::vectordb::VectorStore;
@@ -243,7 +243,7 @@ struct StatusResponse {
 /// 3. Two-level change detection (mtime + hash)
 /// 4. Tracks chunk IDs for efficient incremental updates
 /// 5. **Dual-database support**: Searches both local and global databases
-pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
+pub async fn serve(port: u16, path: Option<PathBuf>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
     let root = path.clone().unwrap_or_else(|| PathBuf::from(".")).canonicalize()?;
 
     println!("{}", "🚀 Demongrep Server".bright_cyan().bold());
@@ -286,7 +286,8 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
     // Initialize embedding service
     let model_type = ModelType::default();
     println!("\n🔄 Loading embedding model...");
-    let embedding_service = EmbeddingService::with_model(model_type)?;
+    println!("   Execution provider: {}", provider.name());
+    let embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
     let dimensions = embedding_service.dimensions();
     println!("   Model: {} ({} dims)", model_type.name(), dimensions);
 
@@ -302,6 +303,9 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
                 root.clone(),
                 local_path.clone(),
                 model_type,
+                provider,
+                device_id,
+                batch_size,
             ).await?;
             (Some(store), Some(file_meta))
         } else {
@@ -330,6 +334,9 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
                             root.clone(),
                             global_path.clone(),
                             model_type,
+                            provider,
+                            device_id,
+                            batch_size,
                         ).await?;
                         (Some(store), Some(file_meta))
                     } else {
@@ -389,6 +396,9 @@ async fn initial_index(
     root: PathBuf,
     db_path: PathBuf,
     model_type: ModelType,
+    provider: ExecutionProviderType,
+    device_id: Option<i32>,
+    batch_size: Option<usize>,
 ) -> Result<(VectorStore, FileMetaStore)> {
     // Clear existing database if any
     if db_path.exists() {
@@ -424,7 +434,7 @@ async fn initial_index(
     println!("  Created {} chunks", all_chunks.len());
 
     // Embedding
-    let mut embedding_service = EmbeddingService::with_model(model_type)?;
+    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
     let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
     println!("  Generated {} embeddings", embedded_chunks.len());
 

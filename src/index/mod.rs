@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::chunker::SemanticChunker;
 use crate::database::DatabaseManager;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingService, ExecutionProviderType, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::vectordb::VectorStore;

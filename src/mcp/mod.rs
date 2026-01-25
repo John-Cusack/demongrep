@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::database::DatabaseManager;  // NEW: Use DatabaseManager
-use crate::embed::EmbeddingService;
+use crate::embed::{EmbeddingService, ExecutionProviderType};
 
 
 /// Demongrep MCP service with dual-database support via DatabaseManager
@@ -27,6 +27,10 @@ pub struct DemongrepService {
     db_manager: DatabaseManager,  // NEW: Replaced db_paths with DatabaseManager
     // Lazily initialized on first search
     embedding_service: Mutex<Option<EmbeddingService>>,
+    // Execution provider configuration
+    provider: ExecutionProviderType,
+    device_id: Option<i32>,
+    batch_size: Option<usize>,
 }
 
 impl std::fmt::Debug for DemongrepService {
@@ -92,11 +96,19 @@ pub struct IndexStatusResponse {
 #[tool_router]
 impl DemongrepService {
     /// Create a new DemongrepService with DatabaseManager
-    pub fn new(db_manager: DatabaseManager) -> Result<Self> {
+    pub fn new(
+        db_manager: DatabaseManager,
+        provider: ExecutionProviderType,
+        device_id: Option<i32>,
+        batch_size: Option<usize>,
+    ) -> Result<Self> {
         Ok(Self {
             tool_router: Self::tool_router(),
             db_manager,
             embedding_service: Mutex::new(None),
+            provider,
+            device_id,
+            batch_size,
         })
     }
 
@@ -104,7 +116,12 @@ impl DemongrepService {
     fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
         let mut guard = self.embedding_service.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(EmbeddingService::with_model(self.db_manager.model_type())?);
+            *guard = Some(EmbeddingService::with_model_and_provider(
+                self.db_manager.model_type(),
+                self.provider,
+                self.device_id,
+                self.batch_size,
+            )?);
         }
         Ok(guard)
     }
@@ -307,7 +324,12 @@ impl ServerHandler for DemongrepService {
 }
 
 /// Run the MCP server using stdio transport with DatabaseManager
-pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
+pub async fn run_mcp_server(
+    path: Option<PathBuf>,
+    provider: ExecutionProviderType,
+    device_id: Option<i32>,
+    batch_size: Option<usize>,
+) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
     // Use DatabaseManager to load all databases
@@ -332,7 +354,7 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
         );
     }
 
-    let service = DemongrepService::new(db_manager)?;
+    let service = DemongrepService::new(db_manager, provider, device_id, batch_size)?;
 
     // Serve using stdio transport
     let server = service.serve(stdio()).await?;

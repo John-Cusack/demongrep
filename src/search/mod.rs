@@ -146,7 +146,7 @@ pub async fn search(
                 let db_type: &str = if db_path.ends_with(".demongrep.db") { "Local" } else { "Global" };
                 println!("{}", format!("🔄 Syncing {} database...", db_type).yellow());
             }
-            sync_database(&db_path, model_type)?;
+            sync_database(&db_path, model_type, provider, device_id, batch_size)?;
         }
         
         // Load this database

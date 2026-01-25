@@ -9,6 +9,15 @@ pub use embedder::{detect_best_provider, ExecutionProviderType, FastEmbedder, Mo
 #[cfg(feature = "cuda")]
 pub use embedder::is_cuda_available;
 
+#[cfg(feature = "tensorrt")]
+pub use embedder::is_tensorrt_available;
+
+#[cfg(feature = "coreml")]
+pub use embedder::is_coreml_available;
+
+#[cfg(feature = "directml")]
+pub use embedder::is_directml_available;
+
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
