@@ -13,7 +13,7 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Context Windows** — Shows surrounding code (3 lines before/after) for better understanding
 - **Local & Private** — All processing happens locally using ONNX models, no data leaves your machine
 - **Fast** — Sub-second search after initial model load, incremental indexing
-- **GPU Acceleration** — Optional CUDA, TensorRT, CoreML, and DirectML support for faster indexing
+- **GPU Acceleration** — Optional CUDA, TensorRT, CoreML, DirectML, and **Ollama** support for faster indexing
 - **Multiple Interfaces** — CLI, HTTP server, and MCP server for Claude Code integration
 
 ---
@@ -39,6 +39,8 @@ Search your codebase using natural language queries like *"where do we handle au
 - [Database Management](#database-management)
 - [Supported Languages](#supported-languages)
 - [Embedding Models](#embedding-models)
+- [GPU Acceleration](#gpu-acceleration)
+- [Ollama Backend](#ollama-backend-recommended-for-gpu)
 - [Configuration](#configuration)
 - [How It Works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
@@ -722,6 +724,7 @@ demongrep supports GPU acceleration for faster embedding generation during index
 | Platform | Build Command |
 |----------|---------------|
 | CPU only (all platforms) | `cargo build --release` |
+| **Ollama backend (recommended)** | `cargo build --release --features ollama` |
 | macOS (Apple Silicon/Intel) | `cargo build --release --features gpu-apple` |
 | Linux/Windows (NVIDIA GPU) | `cargo build --release --features gpu-nvidia` |
 | Windows (DirectX 12 GPU)* | `cargo build --release --features gpu-windows` |
@@ -791,6 +794,127 @@ This results in ~30% faster indexing compared to fixed batch sizes.
 2. **macOS**: Use `--provider coreml` — Apple Silicon gets Neural Engine acceleration, Intel Macs see modest gains
 3. **Check GPU memory**: Use `nvidia-smi` (NVIDIA) or Activity Monitor (macOS) — model uses ~500MB
 4. **Tune token budget**: Set `DEMONGREP_TOKEN_BUDGET` environment variable if needed
+
+---
+
+## Ollama Backend (Recommended for GPU)
+
+demongrep supports [Ollama](https://ollama.ai) as an alternative embedding backend. **This is the recommended approach for GPU acceleration** as it provides significantly better performance than ONNX Runtime.
+
+### Why Ollama?
+
+| Backend | nomic-embed-text (768d) | Notes |
+|---------|-------------------------|-------|
+| FastEmbed CPU | 5.6 chunks/sec | Slow for large models |
+| FastEmbed CUDA | 6.8 chunks/sec | Minimal GPU benefit |
+| Ollama CPU | 2.4 chunks/sec | Model stays warm |
+| **Ollama GPU** | **52.2 chunks/sec** | **~10x faster than FastEmbed** |
+
+With the same model, Ollama with GPU is **~10x faster for indexing** and **~3x faster for search**.
+
+### Setup
+
+#### 1. Install Ollama
+
+**macOS/Linux:**
+```bash
+curl -fsSL https://ollama.ai/install.sh | sh
+```
+
+**Or with Docker (recommended for servers):**
+```bash
+# With GPU support (NVIDIA)
+docker run -d --gpus all --name ollama -p 11434:11434 ollama/ollama
+
+# CPU only
+docker run -d --name ollama -p 11434:11434 ollama/ollama
+```
+
+#### 2. Pull an embedding model
+
+```bash
+ollama pull nomic-embed-text    # 768 dims, recommended
+# or
+ollama pull mxbai-embed-large   # 1024 dims, higher quality
+```
+
+#### 3. Build demongrep with Ollama support
+
+```bash
+cargo build --release --features ollama
+```
+
+#### 4. Index and search
+
+```bash
+# Index with Ollama backend
+demongrep index --backend ollama
+
+# Search with Ollama backend
+demongrep search "authentication" --backend ollama
+
+# Use a different Ollama model
+demongrep index --backend ollama --ollama-model mxbai-embed-large
+```
+
+### Available Ollama Models
+
+| Model | Dimensions | Context | Best For |
+|-------|------------|---------|----------|
+| `nomic-embed-text` | 768 | 8192 | **Recommended** - good balance |
+| `mxbai-embed-large` | 1024 | 512 | Higher quality embeddings |
+| `snowflake-arctic-embed` | 1024 | 512 | High quality |
+| `bge-m3` | 1024 | 8192 | Multilingual support |
+
+### Configuration
+
+Add to `~/.demongrep/config.toml`:
+
+```toml
+[embedding]
+backend = "ollama"  # Use Ollama by default
+
+[embedding.ollama]
+url = "http://localhost:11434"  # Ollama server URL
+model = "nomic-embed-text"       # Embedding model
+timeout = 30                     # Request timeout (seconds)
+parallelism = 8                  # Parallel HTTP requests
+```
+
+### Performance Comparison
+
+Benchmarked on RTX A2000 8GB with 1394 code chunks:
+
+| Metric | FastEmbed (CPU) | Ollama (GPU) | Speedup |
+|--------|-----------------|--------------|---------|
+| Indexing | 5.6 c/s | 52.2 c/s | **9.3x** |
+| Search | 1.27s | 0.43s | **3.0x** |
+| Index 1394 chunks | 264s | 27s | **9.8x** |
+
+### Troubleshooting
+
+**"Cannot connect to Ollama"**
+```bash
+# Check Ollama is running
+curl http://localhost:11434/api/tags
+
+# Start Ollama
+ollama serve
+# or
+docker start ollama
+```
+
+**"Model not found"**
+```bash
+# Pull the model first
+ollama pull nomic-embed-text
+```
+
+**Dimension mismatch error**
+```bash
+# Re-index with --force when switching backends/models
+demongrep index --backend ollama --force
+```
 
 ---
 
