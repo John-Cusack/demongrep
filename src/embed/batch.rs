@@ -1,4 +1,7 @@
+use super::backend::Embedder;
 use super::embedder::{ExecutionProviderType, FastEmbedder};
+#[cfg(feature = "ollama")]
+use super::ollama::OllamaEmbedder;
 use crate::chunker::Chunk;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -83,9 +86,98 @@ impl EmbeddedChunk {
     }
 }
 
+/// Embedding backend implementation wrapper
+///
+/// This enum allows BatchEmbedder to work with different embedding backends
+/// while maintaining type safety and avoiding trait object overhead.
+pub enum EmbedderImpl {
+    /// FastEmbed/ONNX backend (requires mutable access via Mutex)
+    FastEmbed(Arc<Mutex<FastEmbedder>>),
+    /// Ollama backend (thread-safe, uses &self)
+    #[cfg(feature = "ollama")]
+    Ollama(Arc<OllamaEmbedder>),
+}
+
+impl EmbedderImpl {
+    /// Embed a batch of texts
+    fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::FastEmbed(embedder) => {
+                embedder.lock().unwrap().embed_batch(texts)
+            }
+            #[cfg(feature = "ollama")]
+            Self::Ollama(embedder) => {
+                Embedder::embed_batch(embedder.as_ref(), texts)
+            }
+        }
+    }
+
+    /// Embed a single text
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::FastEmbed(embedder) => {
+                embedder.lock().unwrap().embed_one(text)
+            }
+            #[cfg(feature = "ollama")]
+            Self::Ollama(embedder) => {
+                Embedder::embed_one(embedder.as_ref(), text)
+            }
+        }
+    }
+
+    /// Get embedding dimensions
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::FastEmbed(embedder) => {
+                embedder.lock().unwrap().dimensions()
+            }
+            #[cfg(feature = "ollama")]
+            Self::Ollama(embedder) => {
+                embedder.dimensions()
+            }
+        }
+    }
+
+    /// Get model name
+    fn model_name(&self) -> String {
+        match self {
+            Self::FastEmbed(embedder) => {
+                embedder.lock().unwrap().model_name().to_string()
+            }
+            #[cfg(feature = "ollama")]
+            Self::Ollama(embedder) => {
+                embedder.model_name().to_string()
+            }
+        }
+    }
+
+    /// Get model short name
+    fn model_short_name(&self) -> String {
+        match self {
+            Self::FastEmbed(embedder) => {
+                embedder.lock().unwrap().model_type().short_name().to_string()
+            }
+            #[cfg(feature = "ollama")]
+            Self::Ollama(embedder) => {
+                embedder.model_short_name().to_string()
+            }
+        }
+    }
+
+    /// Get backend name
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::FastEmbed(_) => "fastembed",
+            #[cfg(feature = "ollama")]
+            Self::Ollama(_) => "ollama",
+        }
+    }
+}
+
 /// Batch processor for embedding chunks efficiently
 pub struct BatchEmbedder {
     pub embedder: Arc<Mutex<FastEmbedder>>,
+    embedder_impl: EmbedderImpl,
     token_budget: usize,
     provider: ExecutionProviderType,
     model_dims: usize,
@@ -107,7 +199,8 @@ impl BatchEmbedder {
         };
 
         Self {
-            embedder,
+            embedder: embedder.clone(),
+            embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget,
             provider,
             model_dims,
@@ -125,7 +218,8 @@ impl BatchEmbedder {
         // So batch_size=32 → 32 * 500 / 4 = 4000 tokens
         let token_budget = batch_size * 125; // 500 chars / 4 chars per token
         Self {
-            embedder,
+            embedder: embedder.clone(),
+            embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget: token_budget.max(1000), // Minimum 1000 tokens
             provider,
             model_dims,
@@ -139,9 +233,64 @@ impl BatchEmbedder {
             (e.provider(), e.dimensions())
         };
         Self {
-            embedder,
+            embedder: embedder.clone(),
+            embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget,
             provider,
+            model_dims,
+        }
+    }
+
+    /// Create with dynamic embedder (for Ollama backend)
+    #[cfg(feature = "ollama")]
+    pub fn new_dyn(embedder: Arc<OllamaEmbedder>, model_dims: usize) -> Self {
+        let token_budget = Self::calculate_token_budget(&ExecutionProviderType::Cpu, model_dims);
+
+        // Create a dummy FastEmbedder Arc for backwards compatibility
+        // This will only be used if someone accesses .embedder directly (legacy code)
+        // New code should use embedder_impl
+        let dummy_embedder = Arc::new(Mutex::new(
+            FastEmbedder::with_model_and_provider(
+                super::embedder::ModelType::default(),
+                ExecutionProviderType::Cpu,
+                None,
+            )
+            .expect("Failed to create placeholder embedder"),
+        ));
+
+        Self {
+            embedder: dummy_embedder,
+            embedder_impl: EmbedderImpl::Ollama(embedder),
+            token_budget,
+            provider: ExecutionProviderType::Cpu,
+            model_dims,
+        }
+    }
+
+    /// Create with dynamic embedder and custom batch size
+    #[cfg(feature = "ollama")]
+    pub fn with_batch_size_dyn(
+        embedder: Arc<OllamaEmbedder>,
+        batch_size: usize,
+        model_dims: usize,
+    ) -> Self {
+        let token_budget = batch_size * 125;
+
+        // Create a dummy FastEmbedder Arc for backwards compatibility
+        let dummy_embedder = Arc::new(Mutex::new(
+            FastEmbedder::with_model_and_provider(
+                super::embedder::ModelType::default(),
+                ExecutionProviderType::Cpu,
+                None,
+            )
+            .expect("Failed to create placeholder embedder"),
+        ));
+
+        Self {
+            embedder: dummy_embedder,
+            embedder_impl: EmbedderImpl::Ollama(embedder),
+            token_budget: token_budget.max(1000),
+            provider: ExecutionProviderType::Cpu,
             model_dims,
         }
     }
@@ -224,8 +373,8 @@ impl BatchEmbedder {
             // Extract texts for this batch
             let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
 
-            // Generate embeddings
-            let embeddings = self.embedder.lock().unwrap().embed_batch(texts)?;
+            // Generate embeddings using the appropriate backend
+            let embeddings = self.embedder_impl.embed_batch(texts)?;
 
             // Combine with original indices
             for ((orig_idx, _, chunk), embedding) in batch.into_iter().zip(embeddings.into_iter()) {
@@ -290,8 +439,13 @@ impl BatchEmbedder {
     /// Embed a single chunk
     pub fn embed_chunk(&mut self, chunk: Chunk) -> Result<EmbeddedChunk> {
         let text = self.prepare_text(&chunk);
-        let embedding = self.embedder.lock().unwrap().embed_one(&text)?;
+        let embedding = self.embedder_impl.embed_one(&text)?;
         Ok(EmbeddedChunk::new(chunk, embedding))
+    }
+
+    /// Embed a single text string (for query embedding)
+    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedder_impl.embed_one(text)
     }
 
     /// Prepare chunk text for embedding
@@ -332,13 +486,22 @@ impl BatchEmbedder {
 
     /// Get embedding dimensions
     pub fn dimensions(&self) -> usize {
-        self.embedder.lock().unwrap().dimensions()
+        self.embedder_impl.dimensions()
     }
 
-    /// Get embedder (locks mutex and returns copy of embedder for reading)
+    /// Get embedder info (model name and dimensions)
     pub fn embedder_info(&self) -> (String, usize) {
-        let embedder = self.embedder.lock().unwrap();
-        (embedder.model_name().to_string(), embedder.dimensions())
+        (self.embedder_impl.model_name(), self.embedder_impl.dimensions())
+    }
+
+    /// Get model short name
+    pub fn model_short_name(&self) -> String {
+        self.embedder_impl.model_short_name()
+    }
+
+    /// Get backend name
+    pub fn backend_name(&self) -> &'static str {
+        self.embedder_impl.backend_name()
     }
 }
 

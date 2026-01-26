@@ -3,6 +3,9 @@ use crate::info_print;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 use std::str::FromStr;
+use std::sync::Mutex;
+
+use super::backend::Embedder;
 
 /// Execution provider for embedding inference
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -388,8 +391,12 @@ pub fn is_directml_available() -> bool {
 }
 
 /// Fast embedding model using fastembed library
+///
+/// Uses interior mutability via Mutex because fastembed's `embed` method
+/// requires `&mut self`, but we want to implement the `Embedder` trait
+/// which uses `&self` for thread-safe sharing.
 pub struct FastEmbedder {
-    model: TextEmbedding,
+    model: Mutex<TextEmbedding>,
     model_type: ModelType,
     provider: ExecutionProviderType,
 }
@@ -458,7 +465,7 @@ impl FastEmbedder {
         info_print!("   Default batch size: {}", DEFAULT_BATCH_SIZE);
 
         Ok(Self {
-            model,
+            model: Mutex::new(model),
             model_type,
             provider: final_provider,
         })
@@ -488,13 +495,13 @@ impl FastEmbedder {
         }
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
+        let mut model = self.model.lock().unwrap();
 
         // Process in mini-batches to avoid OOM with large models
         for chunk in texts.chunks(batch_size) {
             let text_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
 
-            let embeddings = self
-                .model
+            let embeddings = model
                 .embed(text_refs, None)
                 .map_err(|e| anyhow!("Failed to generate embeddings: {}", e))?;
 
@@ -542,6 +549,50 @@ impl FastEmbedder {
 impl Default for FastEmbedder {
     fn default() -> Self {
         Self::new().expect("Failed to create default embedder")
+    }
+}
+
+/// Implementation of the backend-agnostic Embedder trait for FastEmbedder
+///
+/// This allows FastEmbedder to be used interchangeably with other backends
+/// like OllamaEmbedder through the unified Embedder interface.
+///
+/// Uses interior mutability (Mutex) because fastembed's embed requires `&mut self`
+/// but the trait uses `&self` for thread-safe sharing.
+impl Embedder for FastEmbedder {
+    fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let mut model = self.model.lock().unwrap();
+        model
+            .embed(text_refs, None)
+            .map_err(|e| anyhow!("Embedding failed: {}", e))
+    }
+
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        Embedder::embed_batch(self, vec![text.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No embedding generated"))
+    }
+
+    fn dimensions(&self) -> usize {
+        self.model_type.dimensions()
+    }
+
+    fn model_name(&self) -> &str {
+        self.model_type.name()
+    }
+
+    fn model_short_name(&self) -> &str {
+        self.model_type.short_name()
+    }
+
+    fn backend_name(&self) -> &str {
+        "fastembed"
     }
 }
 

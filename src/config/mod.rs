@@ -10,6 +10,13 @@
 //! provider = "cpu"
 //! device_id = 0
 //! batch_size = 256
+//! backend = "fastembed"  # or "ollama"
+//!
+//! [embedding.ollama]
+//! url = "http://localhost:11434"
+//! model = "nomic-embed-text"
+//! timeout = 30
+//! parallelism = 8
 //!
 //! [indexing]
 //! max_chunk_lines = 75
@@ -48,6 +55,12 @@ pub struct EmbeddingConfig {
 
     /// Batch size for embedding (None = auto-detect based on provider)
     pub batch_size: Option<usize>,
+
+    /// Embedding backend: "fastembed" (default) or "ollama"
+    pub backend: String,
+
+    /// Ollama-specific configuration
+    pub ollama: OllamaConfig,
 }
 
 impl Default for EmbeddingConfig {
@@ -57,6 +70,33 @@ impl Default for EmbeddingConfig {
             provider: "cpu".to_string(),
             device_id: 0,
             batch_size: None, // Auto-detect
+            backend: "fastembed".to_string(),
+            ollama: OllamaConfig::default(),
+        }
+    }
+}
+
+/// Ollama backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OllamaConfig {
+    /// Ollama server URL
+    pub url: String,
+    /// Embedding model name
+    pub model: String,
+    /// Request timeout in seconds
+    pub timeout: u64,
+    /// Number of parallel HTTP requests
+    pub parallelism: usize,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://localhost:11434".to_string(),
+            model: "nomic-embed-text".to_string(),
+            timeout: 30,
+            parallelism: 8,
         }
     }
 }
@@ -159,6 +199,9 @@ mod tests {
         assert_eq!(config.embedding.device_id, 0);
         assert!(config.embedding.model.is_none());
         assert!(config.embedding.batch_size.is_none());
+        assert_eq!(config.embedding.backend, "fastembed");
+        assert_eq!(config.embedding.ollama.url, "http://localhost:11434");
+        assert_eq!(config.embedding.ollama.model, "nomic-embed-text");
     }
 
     #[test]
@@ -234,5 +277,33 @@ provider = "auto"
 
         assert!(toml_str.contains("[embedding]"));
         assert!(toml_str.contains("provider = \"cpu\""));
+        assert!(toml_str.contains("backend = \"fastembed\""));
+        assert!(toml_str.contains("[embedding.ollama]"));
+    }
+
+    #[test]
+    fn test_ollama_config() {
+        let toml_content = r#"
+[embedding]
+backend = "ollama"
+
+[embedding.ollama]
+url = "http://custom:11434"
+model = "mxbai-embed-large"
+timeout = 60
+parallelism = 4
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let config = Config::load_from(&path).unwrap();
+
+        assert_eq!(config.embedding.backend, "ollama");
+        assert_eq!(config.embedding.ollama.url, "http://custom:11434");
+        assert_eq!(config.embedding.ollama.model, "mxbai-embed-large");
+        assert_eq!(config.embedding.ollama.timeout, 60);
+        assert_eq!(config.embedding.ollama.parallelism, 4);
     }
 }

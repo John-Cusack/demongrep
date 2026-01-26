@@ -1,11 +1,19 @@
+mod backend;
 mod batch;
 mod cache;
 mod embedder;
+#[cfg(feature = "ollama")]
+mod ollama;
 pub mod tuning;
 
+pub use backend::{EmbeddingBackend, Embedder};
 pub use batch::{BatchEmbedder, EmbeddedChunk};
 pub use cache::{CacheStats, CachedBatchEmbedder};
 pub use embedder::{detect_best_provider, ExecutionProviderType, FastEmbedder, ModelType};
+#[cfg(feature = "ollama")]
+pub use ollama::OllamaEmbedder;
+#[cfg(feature = "ollama")]
+pub use ollama::known_dimensions as ollama_dimensions;
 
 #[cfg(feature = "cuda")]
 pub use embedder::is_cuda_available;
@@ -22,10 +30,13 @@ pub use embedder::is_directml_available;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
+use crate::config::Config;
+
 /// High-level embedding service that combines all features
 pub struct EmbeddingService {
     cached_embedder: CachedBatchEmbedder,
     model_type: ModelType,
+    backend: EmbeddingBackend,
 }
 
 impl EmbeddingService {
@@ -47,7 +58,6 @@ impl EmbeddingService {
         batch_size: Option<usize>,
     ) -> Result<Self> {
         let embedder = FastEmbedder::with_model_and_provider(model_type, provider, device_id)?;
-        let resolved_provider = embedder.provider();
         let arc_embedder = Arc::new(Mutex::new(embedder));
 
         // Use explicit batch_size if provided (from config), otherwise use dynamic token budget
@@ -60,7 +70,64 @@ impl EmbeddingService {
         Ok(Self {
             cached_embedder,
             model_type,
+            backend: EmbeddingBackend::FastEmbed,
         })
+    }
+
+    /// Create embedding service with specified backend
+    ///
+    /// This is the preferred factory method that supports both FastEmbed and Ollama backends.
+    ///
+    /// # Arguments
+    /// * `backend` - The embedding backend to use
+    /// * `config` - Full configuration (for Ollama settings)
+    /// * `model_type` - Optional FastEmbed model type (ignored for Ollama)
+    /// * `provider` - Execution provider for FastEmbed (ignored for Ollama)
+    /// * `device_id` - GPU device ID for FastEmbed (ignored for Ollama)
+    /// * `batch_size` - Optional batch size override
+    pub fn with_backend(
+        backend: EmbeddingBackend,
+        #[allow(unused_variables)] config: &Config,
+        model_type: Option<ModelType>,
+        provider: ExecutionProviderType,
+        device_id: Option<i32>,
+        batch_size: Option<usize>,
+    ) -> Result<Self> {
+        match backend {
+            EmbeddingBackend::FastEmbed => {
+                let model = model_type.unwrap_or_default();
+                Self::with_model_and_provider(model, provider, device_id, batch_size)
+            }
+            #[cfg(feature = "ollama")]
+            EmbeddingBackend::Ollama => {
+                use crate::info_print;
+
+                info_print!("📦 Loading Ollama embedding backend");
+                info_print!("   Model: {}", config.embedding.ollama.model);
+                info_print!("   URL: {}", config.embedding.ollama.url);
+
+                let ollama_embedder = OllamaEmbedder::new(config.embedding.ollama.clone())?;
+                let dimensions = ollama_embedder.dimensions();
+
+                // Wrap in Arc for BatchEmbedder compatibility
+                let arc_embedder = Arc::new(ollama_embedder);
+
+                // Create batch embedder (token budgeting still applies)
+                let batch_embedder = match batch_size {
+                    Some(size) => BatchEmbedder::with_batch_size_dyn(arc_embedder, size, dimensions),
+                    None => BatchEmbedder::new_dyn(arc_embedder, dimensions),
+                };
+                let cached_embedder = CachedBatchEmbedder::new(batch_embedder);
+
+                info_print!("✅ Ollama backend loaded successfully!");
+
+                Ok(Self {
+                    cached_embedder,
+                    model_type: model_type.unwrap_or_default(), // Placeholder for Ollama
+                    backend: EmbeddingBackend::Ollama,
+                })
+            }
+        }
     }
 
     /// Embed a batch of chunks with caching
@@ -78,9 +145,8 @@ impl EmbeddingService {
 
     /// Embed query text
     pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
-        // Access the batch embedder's embedder via mutex
-        let embedder_arc = &self.cached_embedder.batch_embedder.embedder;
-        embedder_arc.lock().unwrap().embed_one(query)
+        // Use the batch embedder's embed_one which uses the correct backend
+        self.cached_embedder.batch_embedder.embed_one(query)
     }
 
     /// Get embedding dimensions
@@ -99,8 +165,22 @@ impl EmbeddingService {
     }
 
     /// Get model short name (for storage)
-    pub fn model_short_name(&self) -> &str {
-        self.model_type.short_name()
+    pub fn model_short_name(&self) -> String {
+        // For Ollama backend, get from the batch embedder which has the actual model info
+        match self.backend {
+            EmbeddingBackend::FastEmbed => self.model_type.short_name().to_string(),
+            #[cfg(feature = "ollama")]
+            EmbeddingBackend::Ollama => {
+                // Return the configured Ollama model name
+                // The actual name is stored in the embedder, but we can use the batch embedder's info
+                self.cached_embedder.batch_embedder.model_short_name()
+            }
+        }
+    }
+
+    /// Get the embedding backend being used
+    pub fn backend(&self) -> EmbeddingBackend {
+        self.backend
     }
 
     /// Get cache statistics
