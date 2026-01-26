@@ -115,8 +115,8 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// [DEPRECATED] No longer needed - index is always incremental
-        #[arg(short, long, hide = true)]
+        /// Force full re-index (delete existing database first)
+        #[arg(short, long)]
         force: bool,
 
         /// Index to global database in home directory instead of local .demongrep.db
@@ -344,7 +344,7 @@ pub async fn run() -> Result<()> {
             device_id: _,
         } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), batch_size).await,
         Commands::Serve { port, path, provider: _, device_id: _ } => {
-            crate::server::serve(port, path, provider_type, Some(device_id), batch_size).await
+            crate::server::serve(port, path, model_type, provider_type, Some(device_id), batch_size).await
         }
         Commands::List => crate::index::list().await,
         Commands::Stats { path } => crate::index::stats(path).await,

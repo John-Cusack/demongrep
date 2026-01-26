@@ -200,10 +200,10 @@ fn remove_from_project_mapping(project_name: &str) -> Result<()> {
 }
 
 /// Index a repository
-pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: bool, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
+pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bool, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
-    
+
     // Check for existing databases (local and global)
     let local_db_path = canonical_path.join(".demongrep.db");
     let global_db_path = if let Some(home) = dirs::home_dir() {
@@ -214,9 +214,32 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, _force: bool, global: b
     } else {
         None
     };
-    
-    let local_exists = local_db_path.exists();
-    let global_exists = global_db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    let mut local_exists = local_db_path.exists();
+    let mut global_exists = global_db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    // Handle --force: delete existing database(s) first
+    if force {
+        if global {
+            // Force with --global: delete global database
+            if let Some(ref gp) = global_db_path {
+                if gp.exists() {
+                    println!("{}", "🗑️  Force flag: deleting existing global database...".yellow());
+                    std::fs::remove_dir_all(gp)?;
+                    global_exists = false;
+                    // Clean up projects.json
+                    let _ = cleanup_project_mappings(&[gp.clone()]);
+                }
+            }
+        } else {
+            // Force without --global: delete local database
+            if local_db_path.exists() {
+                println!("{}", "🗑️  Force flag: deleting existing local database...".yellow());
+                std::fs::remove_dir_all(&local_db_path)?;
+                local_exists = false;
+            }
+        }
+    }
     
     // Enforce exclusivity: can't have both local AND global
     if local_exists && global_exists {

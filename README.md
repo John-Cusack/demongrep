@@ -34,7 +34,7 @@ Search your codebase using natural language queries like *"where do we handle au
   - [setup](#setup)
 - [Global Options](#global-options)
 - [Search Modes](#search-modes)
-- [MCP Server (Claude Code)](#mcp-server-claude-code-integration)
+- [MCP Server (Claude Code & OpenCode)](#mcp-server-claude-code-integration)
 - [HTTP Server API](#http-server-api)
 - [Database Management](#database-management)
 - [Supported Languages](#supported-languages)
@@ -437,11 +437,13 @@ demongrep search "query" --rerank
 
 ---
 
-## MCP Server (Claude Code Integration)
+## MCP Server (Claude Code & OpenCode Integration)
 
-demongrep can act as an MCP server, allowing Claude Code to search your codebase.
+demongrep can act as an MCP server, allowing AI coding assistants to search your codebase semantically.
 
-### Setup
+### Claude Code Integration
+
+#### Setup
 
 1. **Build demongrep** and note the binary path:
    ```bash
@@ -472,7 +474,7 @@ demongrep can act as an MCP server, allowing Claude Code to search your codebase
 
 4. **Restart Claude Code**
 
-### Available MCP Tools
+#### Available MCP Tools
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
@@ -480,12 +482,65 @@ demongrep can act as an MCP server, allowing Claude Code to search your codebase
 | `get_file_chunks` | `path` | Get all indexed chunks from a file |
 | `index_status` | | Check if index exists and get stats |
 
-### Example MCP Usage in Claude Code
+#### Example Usage
 
 Once configured, Claude Code can use commands like:
 - *"Search for authentication handling"*
 - *"Find all chunks in src/auth.rs"*
 - *"Check if the index is ready"*
+
+### OpenCode Integration
+
+demongrep also works with [OpenCode](https://opencode.ai) as an MCP server.
+
+1. **Index your project**:
+   ```bash
+   cd /path/to/your/project
+   demongrep index
+   ```
+
+2. **Configure OpenCode**
+
+   Edit `~/.config/opencode/opencode.json`:
+
+   ```json
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "mcp": {
+       "demongrep": {
+         "type": "local",
+         "command": ["/absolute/path/to/demongrep", "mcp"],
+         "enabled": true,
+         "timeout": 30000
+       }
+     }
+   }
+   ```
+
+   Without a path argument, demongrep uses the current working directory, which is typically what you want for per-project search.
+
+3. **Start OpenCode** in an indexed project directory
+
+The following tools will be available:
+- `demongrep/semantic_search` - Natural language code search
+- `demongrep/get_file_chunks` - Get indexed chunks from a file
+- `demongrep/index_status` - Check index statistics
+
+#### Per-Project Configuration
+
+For project-specific config, create `opencode.json` in your project root:
+
+```json
+{
+  "mcp": {
+    "demongrep": {
+      "type": "local",
+      "command": ["/absolute/path/to/demongrep", "mcp", "."],
+      "enabled": true
+    }
+  }
+}
+```
 
 ---
 

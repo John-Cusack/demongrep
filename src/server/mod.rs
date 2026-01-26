@@ -243,7 +243,7 @@ struct StatusResponse {
 /// 3. Two-level change detection (mtime + hash)
 /// 4. Tracks chunk IDs for efficient incremental updates
 /// 5. **Dual-database support**: Searches both local and global databases
-pub async fn serve(port: u16, path: Option<PathBuf>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
+pub async fn serve(port: u16, path: Option<PathBuf>, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
     let root = path.clone().unwrap_or_else(|| PathBuf::from(".")).canonicalize()?;
 
     println!("{}", "🚀 Demongrep Server".bright_cyan().bold());
@@ -284,7 +284,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>, provider: ExecutionProvider
     }
 
     // Initialize embedding service
-    let model_type = ModelType::default();
+    let model_type = model.unwrap_or_default();
     println!("\n🔄 Loading embedding model...");
     println!("   Execution provider: {}", provider.name());
     let embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
