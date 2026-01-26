@@ -652,13 +652,28 @@ demongrep supports GPU acceleration for faster embedding generation during index
 
 | Provider | Platform | Flag | Build Feature |
 |----------|----------|------|---------------|
-| CPU | All (Linux, macOS, Windows) | `--provider cpu` | (default) |
-| CUDA | Linux/Windows + NVIDIA GPU | `--provider cuda` | `--features cuda` |
-| TensorRT | Linux/Windows + NVIDIA GPU | `--provider tensorrt` | `--features tensorrt` |
-| CoreML | macOS (Intel & Apple Silicon) | `--provider coreml` | `--features coreml` |
-| DirectML | Windows (DirectX 12 GPU) | `--provider directml` | `--features directml` |
+| CPU | All (Linux, macOS, Windows*) | `--provider cpu` | (default) |
+| CUDA | Linux/Windows* + NVIDIA GPU | `--provider cuda` | `--features gpu-nvidia` |
+| TensorRT | Linux/Windows* + NVIDIA GPU | `--provider tensorrt` | `--features tensorrt` |
+| CoreML | macOS (Intel & Apple Silicon) | `--provider coreml` | `--features gpu-apple` |
+| DirectML | Windows* (DirectX 12 GPU) | `--provider directml` | `--features gpu-windows` |
+
+*Windows support has not been tested.
 
 ### Building with GPU Support
+
+#### Quick Reference
+
+| Platform | Build Command |
+|----------|---------------|
+| CPU only (all platforms) | `cargo build --release` |
+| macOS (Apple Silicon/Intel) | `cargo build --release --features gpu-apple` |
+| Linux/Windows (NVIDIA GPU) | `cargo build --release --features gpu-nvidia` |
+| Windows (DirectX 12 GPU)* | `cargo build --release --features gpu-windows` |
+
+*Windows support has not been tested.
+
+#### Detailed Build Instructions
 
 **Basic CPU build (all platforms):**
 ```bash
@@ -666,27 +681,27 @@ cargo build --release
 ```
 This works on Linux, macOS (Intel & Apple Silicon), and Windows. No GPU features needed.
 
-**Linux/Windows with NVIDIA GPU:**
-```bash
-# CUDA support (requires NVIDIA drivers)
-cargo build --release --features cuda
-
-# TensorRT support (requires TensorRT SDK installed)
-cargo build --release --features tensorrt
-```
-
 **macOS (Intel & Apple Silicon):**
 ```bash
 # CoreML support - uses Apple's ML framework (built into macOS)
 # Apple Silicon: Uses Neural Engine + GPU for acceleration
 # Intel Mac: Uses CPU/GPU, still faster than pure CPU provider
-cargo build --release --features coreml
+cargo build --release --features gpu-apple
 ```
 No additional dependencies beyond the Homebrew prerequisites. CoreML is built into macOS 10.13+.
 
-**Windows with DirectX 12 GPU:**
+**Linux/Windows with NVIDIA GPU:**
 ```bash
-cargo build --release --features directml
+# CUDA support (requires NVIDIA drivers)
+cargo build --release --features gpu-nvidia
+
+# TensorRT support (requires TensorRT SDK installed)
+cargo build --release --features tensorrt
+```
+
+**Windows with DirectX 12 GPU (untested):**
+```bash
+cargo build --release --features gpu-windows
 ```
 
 ### Usage
