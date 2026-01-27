@@ -600,7 +600,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     
     // Save database metadata
     store.save_db_metadata(
-        embedding_service.model_name(),
+        &embedding_service.model_name(),
         embedding_service.dimensions(),
         !is_incremental // mark_full_index only on first index
     )?;

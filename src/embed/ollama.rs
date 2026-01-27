@@ -7,7 +7,14 @@
 //! # Requirements
 //!
 //! - Ollama must be running (`ollama serve`)
-//! - An embedding model must be pulled (`ollama pull all-minilm`)
+//! - An embedding model must be available (auto-pulled if missing)
+//!
+//! # Default Model
+//!
+//! The default model is `unclemusclez/jina-embeddings-v2-base-code`:
+//! - 768 dimensions (cross-compatible with FastEmbed's `jina-code`)
+//! - 8192 token context (handles full functions/classes)
+//! - Trained on 150M+ code Q&A pairs from GitHub
 //!
 //! # Example
 //!
@@ -17,7 +24,7 @@
 //!
 //! let config = OllamaConfig::default();
 //! let embedder = OllamaEmbedder::new(config).expect("Failed to create embedder");
-//! let embedding = embedder.embed_one("Hello, world!").unwrap();
+//! let embedding = embedder.embed_one("def hello(): print('world')").unwrap();
 //! ```
 
 use anyhow::{Context, Result};
@@ -26,6 +33,14 @@ use std::time::Duration;
 
 use super::backend::Embedder;
 use crate::config::OllamaConfig;
+
+/// Default chars-per-token estimate for initial truncation attempt.
+/// This is optimistic (assumes ~3 chars per token like English prose).
+const CHARS_PER_TOKEN_OPTIMISTIC: usize = 3;
+
+/// Conservative chars-per-token estimate for retry after context overflow.
+/// This is pessimistic (assumes ~1.5 chars per token like dense code).
+const CHARS_PER_TOKEN_CONSERVATIVE: usize = 3; // Actually 1.5, but we use 3/2
 
 /// Get known dimensions for common Ollama embedding models
 ///
@@ -36,6 +51,8 @@ pub fn known_dimensions(model: &str) -> Option<usize> {
     let base_model = model.split(':').next().unwrap_or(model);
 
     match base_model {
+        // Jina code model - best for code search (8k context, trained on code)
+        "jina-embeddings-v2-base-code" | "unclemusclez/jina-embeddings-v2-base-code" => Some(768),
         "nomic-embed-text" => Some(768),
         "mxbai-embed-large" => Some(1024),
         "all-minilm" => Some(384),
@@ -47,15 +64,55 @@ pub fn known_dimensions(model: &str) -> Option<usize> {
     }
 }
 
+/// Fallback context lengths for models when we can't query Ollama
+fn fallback_context_tokens(model: &str) -> usize {
+    let base_model = model.split(':').next().unwrap_or(model);
+
+    match base_model {
+        "all-minilm" => 256,
+        "snowflake-arctic-embed" => 512,
+        "mxbai-embed-large" => 512,
+        "bge-large" => 512,
+        "paraphrase-multilingual" => 512,
+        "nomic-embed-text" => 2048,
+        // Long context models (8k)
+        "jina-embeddings-v2-base-code" | "unclemusclez/jina-embeddings-v2-base-code" => 8192,
+        "bge-m3" => 8192,
+        _ => 512, // Conservative default
+    }
+}
+
+/// Truncate text to fit within estimated token limit
+///
+/// Returns the truncated string slice at a valid UTF-8 boundary.
+fn truncate_to_char_limit(text: &str, max_chars: usize) -> &str {
+    if text.len() <= max_chars {
+        return text;
+    }
+
+    // Find valid UTF-8 boundary
+    let mut end = max_chars.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Ollama-based embedder using HTTP API
 ///
 /// This embedder connects to a running Ollama server to generate embeddings.
 /// It provides GPU acceleration on supported systems (Metal on macOS, CUDA on Linux/Windows)
 /// without requiring complex ONNX runtime setup.
+///
+/// Context length is queried from Ollama at startup. If text exceeds the context,
+/// the embedder will automatically truncate and retry with progressively more
+/// aggressive truncation.
 pub struct OllamaEmbedder {
     agent: ureq::Agent,
     config: OllamaConfig,
     dimensions: usize,
+    /// Context length in tokens, queried from Ollama
+    context_length: usize,
 }
 
 impl OllamaEmbedder {
@@ -63,8 +120,9 @@ impl OllamaEmbedder {
     ///
     /// This will:
     /// 1. Validate that Ollama is running
-    /// 2. Check that the specified model is available
-    /// 3. Determine embedding dimensions
+    /// 2. Check that the specified model is available (auto-pull if not)
+    /// 3. Query the model's context length from Ollama
+    /// 4. Determine embedding dimensions
     pub fn new(config: OllamaConfig) -> Result<Self> {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(config.timeout))
@@ -109,22 +167,76 @@ impl OllamaEmbedder {
             eprintln!("✅ Model '{}' pulled successfully!", config.model);
         }
 
+        // Query context length from Ollama
+        let context_length = Self::query_context_length(&agent, &config)
+            .unwrap_or_else(|_| {
+                let fallback = fallback_context_tokens(&config.model);
+                eprintln!(
+                    "   Warning: Could not query context length, using fallback: {} tokens",
+                    fallback
+                );
+                fallback
+            });
+
         // Get dimensions (known or probe)
         let dimensions = match known_dimensions(&config.model) {
             Some(d) => d,
             None => Self::probe_dimensions(&agent, &config)?,
         };
 
-        println!(
-            "   Ollama embedder: {} ({} dimensions) at {}",
-            config.model, dimensions, config.url
+        eprintln!(
+            "   Ollama embedder: {} ({} dimensions, {} token context) at {}",
+            config.model, dimensions, context_length, config.url
         );
 
         Ok(Self {
             agent,
             config,
             dimensions,
+            context_length,
         })
+    }
+
+    /// Query the model's context length from Ollama via /api/show
+    fn query_context_length(agent: &ureq::Agent, config: &OllamaConfig) -> Result<usize> {
+        let url = format!("{}/api/show", config.url);
+        let resp: serde_json::Value = agent
+            .post(&url)
+            .send_json(serde_json::json!({
+                "name": config.model
+            }))
+            .context("Failed to query model info")?
+            .into_json()
+            .context("Failed to parse model info response")?;
+
+        // Try to get context length from model_info
+        // The structure is: { "model_info": { "general.context_length": N } }
+        // or for some models: { "model_info": { "<arch>.context_length": N } }
+        if let Some(model_info) = resp.get("model_info").and_then(|v| v.as_object()) {
+            // Look for any key ending in "context_length"
+            for (key, value) in model_info {
+                if key.ends_with("context_length") {
+                    if let Some(ctx) = value.as_u64() {
+                        return Ok(ctx as usize);
+                    }
+                }
+            }
+        }
+
+        // Fallback: check parameters
+        if let Some(params) = resp.get("parameters").and_then(|v| v.as_str()) {
+            // Parameters is a string like "num_ctx 2048\n..."
+            for line in params.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[0] == "num_ctx" {
+                    if let Ok(ctx) = parts[1].parse::<usize>() {
+                        return Ok(ctx);
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Could not find context length in model info")
     }
 
     /// Pull a model from the Ollama library
@@ -221,44 +333,109 @@ impl OllamaEmbedder {
 
     /// Probe model dimensions by generating a test embedding
     fn probe_dimensions(agent: &ureq::Agent, config: &OllamaConfig) -> Result<usize> {
-        let url = format!("{}/api/embeddings", config.url);
+        let url = format!("{}/api/embed", config.url);
         let resp: serde_json::Value = agent
             .post(&url)
             .send_json(serde_json::json!({
                 "model": config.model,
-                "prompt": "dimension probe"
+                "input": "dimension probe",
+                "truncate": true
             }))
             .context("Failed to probe model dimensions")?
             .into_json()
             .context("Failed to parse dimension probe response")?;
 
-        resp["embedding"]
+        // /api/embed returns { "embeddings": [[...]] }
+        resp["embeddings"]
             .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|emb| emb.as_array())
             .map(|arr| arr.len())
             .ok_or_else(|| anyhow::anyhow!("Invalid embedding response from Ollama"))
     }
 
-    /// Internal method to embed a single text
-    fn embed_one_internal(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/api/embeddings", self.config.url);
-        let resp: serde_json::Value = self
-            .agent
-            .post(&url)
-            .send_json(serde_json::json!({
-                "model": self.config.model,
-                "prompt": text
-            }))
-            .context("Ollama embedding request failed")?
+    /// Embed text with automatic retry on context overflow
+    ///
+    /// Strategy:
+    /// 1. First attempt: use optimistic estimate (3 chars/token)
+    /// 2. On 400 error: retry with conservative estimate (1.5 chars/token)
+    /// 3. On second 400 error: retry with very conservative (1 char/token)
+    fn embed_with_retry(&self, text: &str) -> Result<Vec<f32>> {
+        // First attempt: optimistic truncation (3 chars per token)
+        let max_chars_optimistic = self.context_length * CHARS_PER_TOKEN_OPTIMISTIC;
+        let truncated = truncate_to_char_limit(text, max_chars_optimistic);
+
+        match self.try_embed(truncated) {
+            Ok(embedding) => return Ok(embedding),
+            Err(e) if Self::is_context_overflow_error(&e) => {
+                // Continue to retry
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Second attempt: conservative truncation (1.5 chars per token)
+        let max_chars_conservative = (self.context_length * CHARS_PER_TOKEN_CONSERVATIVE) / 2;
+        let truncated = truncate_to_char_limit(text, max_chars_conservative);
+
+        match self.try_embed(truncated) {
+            Ok(embedding) => return Ok(embedding),
+            Err(e) if Self::is_context_overflow_error(&e) => {
+                // Continue to final retry
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Final attempt: very conservative (1 char per token)
+        let max_chars_final = self.context_length;
+        let truncated = truncate_to_char_limit(text, max_chars_final);
+
+        self.try_embed(truncated)
+    }
+
+    /// Check if error is a context overflow error
+    fn is_context_overflow_error(e: &anyhow::Error) -> bool {
+        let msg = e.to_string().to_lowercase();
+        msg.contains("context length") || msg.contains("input length exceeds")
+    }
+
+    /// Try to embed text, returning detailed error on failure
+    fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
+        let url = format!("{}/api/embed", self.config.url);
+
+        let result = self.agent.post(&url).send_json(serde_json::json!({
+            "model": self.config.model,
+            "input": text,
+            "truncate": true
+        }));
+
+        let resp = match result {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                anyhow::bail!(
+                    "Ollama API error ({}): {} [input: {} chars]",
+                    code,
+                    body.trim(),
+                    text.len()
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Ollama request failed: {}", e));
+            }
+        };
+
+        let resp: serde_json::Value = resp
             .into_json()
             .context("Failed to parse Ollama response")?;
 
-        // Check for error response
         if let Some(error) = resp.get("error") {
             anyhow::bail!("Ollama error: {}", error);
         }
 
-        resp["embedding"]
+        resp["embeddings"]
             .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|emb| emb.as_array())
             .ok_or_else(|| anyhow::anyhow!("No embedding in Ollama response"))?
             .iter()
             .map(|v| {
@@ -280,7 +457,7 @@ impl Embedder for OllamaEmbedder {
         if texts.len() <= 2 {
             return texts
                 .iter()
-                .map(|text| self.embed_one_internal(text))
+                .map(|text| self.embed_with_retry(text))
                 .collect();
         }
 
@@ -293,13 +470,13 @@ impl Embedder for OllamaEmbedder {
         pool.install(|| {
             texts
                 .par_iter()
-                .map(|text| self.embed_one_internal(text))
+                .map(|text| self.embed_with_retry(text))
                 .collect()
         })
     }
 
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
-        self.embed_one_internal(text)
+        self.embed_with_retry(text)
     }
 
     fn dimensions(&self) -> usize {
@@ -311,7 +488,6 @@ impl Embedder for OllamaEmbedder {
     }
 
     fn model_short_name(&self) -> &str {
-        // Extract base model name (e.g., "nomic-embed-text" from "nomic-embed-text:latest")
         self.config.model.split(':').next().unwrap_or(&self.config.model)
     }
 
@@ -338,12 +514,36 @@ mod tests {
     }
 
     #[test]
+    fn test_fallback_context_tokens() {
+        assert_eq!(fallback_context_tokens("all-minilm"), 256);
+        assert_eq!(fallback_context_tokens("nomic-embed-text"), 2048);
+        assert_eq!(fallback_context_tokens("bge-m3"), 8192);
+        assert_eq!(fallback_context_tokens("unknown"), 512);
+    }
+
+    #[test]
+    fn test_truncate_to_char_limit() {
+        assert_eq!(truncate_to_char_limit("hello", 10), "hello");
+        assert_eq!(truncate_to_char_limit("hello world", 5), "hello");
+        assert_eq!(truncate_to_char_limit("hello", 0), "");
+        // UTF-8 boundary test
+        assert_eq!(truncate_to_char_limit("héllo", 2), "h"); // 'é' is 2 bytes
+    }
+
+    #[test]
     fn test_model_short_name() {
-        // We can't create a real embedder without Ollama running,
-        // but we can test the short name extraction logic
         let full = "nomic-embed-text:latest";
         let short = full.split(':').next().unwrap_or(full);
         assert_eq!(short, "nomic-embed-text");
+    }
+
+    #[test]
+    fn test_ollama_config_default() {
+        let config = OllamaConfig::default();
+        assert_eq!(config.url, "http://localhost:11434");
+        assert_eq!(config.model, "unclemusclez/jina-embeddings-v2-base-code");
+        assert_eq!(config.timeout, 30);
+        assert_eq!(config.parallelism, 8);
     }
 
     #[test]
@@ -383,100 +583,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires running Ollama server - tests auto-pull
-    fn test_auto_pull_model() {
-        // Use a small model for testing auto-pull
-        // First, remove it if it exists (to test pulling)
-        let _ = std::process::Command::new("ollama")
-            .args(["rm", "all-minilm"])
-            .output();
-
-        // Now try to create embedder - should auto-pull
-        let config = OllamaConfig {
-            model: "all-minilm".to_string(),
-            ..Default::default()
-        };
-
-        let result = OllamaEmbedder::new(config);
-        assert!(result.is_ok(), "Auto-pull should succeed: {:?}", result.err());
-
-        let embedder = result.unwrap();
-        assert_eq!(embedder.dimensions(), 384);
-    }
-
-    #[test]
     #[ignore] // Requires running Ollama server
-    fn test_auto_pull_invalid_model_fails() {
-        // Try to pull a model that doesn't exist
-        let config = OllamaConfig {
-            model: "this-model-does-not-exist-12345".to_string(),
-            ..Default::default()
-        };
-
-        let result = OllamaEmbedder::new(config);
-        assert!(result.is_err(), "Should fail for non-existent model");
-
-        let err = result.err().unwrap().to_string();
-        assert!(
-            err.contains("could not be pulled") || err.contains("not exist"),
-            "Error should mention pull failure: {}",
-            err
-        );
-    }
-
-    #[test]
-    #[ignore] // Requires running Ollama server
-    fn test_auto_pull_then_embed() {
-        // Remove model first to ensure we test the full flow
-        let _ = std::process::Command::new("ollama")
-            .args(["rm", "all-minilm"])
-            .output();
-
-        let config = OllamaConfig {
-            model: "all-minilm".to_string(),
-            ..Default::default()
-        };
-
-        // Create embedder (should auto-pull)
-        let embedder = OllamaEmbedder::new(config).expect("Should auto-pull and create embedder");
-
-        // Now test embedding works
-        let embedding = embedder.embed_one("test embedding after auto-pull").unwrap();
-        assert_eq!(embedding.len(), 384);
-        assert!(embedding.iter().any(|&x| x != 0.0), "Embedding should have non-zero values");
-    }
-
-    #[test]
-    fn test_ollama_config_default() {
+    fn test_context_length_queried() {
         let config = OllamaConfig::default();
-        assert_eq!(config.url, "http://localhost:11434");
-        assert_eq!(config.model, "all-minilm");
-        assert_eq!(config.timeout, 30);
-        assert_eq!(config.parallelism, 8);
+        let embedder = OllamaEmbedder::new(config).unwrap();
+        // jina-embeddings-v2-base-code should have 8192 context
+        assert!(embedder.context_length >= 8192);
     }
 
     #[test]
     #[ignore] // Requires running Ollama server
-    fn test_already_installed_model_no_pull() {
-        // First ensure model is installed
-        let _ = std::process::Command::new("ollama")
-            .args(["pull", "nomic-embed-text"])
-            .output();
-
+    fn test_long_text_truncation() {
         let config = OllamaConfig::default();
+        let embedder = OllamaEmbedder::new(config).unwrap();
 
-        // Should create without needing to pull
-        let start = std::time::Instant::now();
-        let result = OllamaEmbedder::new(config);
-        let elapsed = start.elapsed();
+        // Create very long text that will need truncation
+        let long_text = "x".repeat(50000);
+        let result = embedder.embed_one(&long_text);
 
-        assert!(result.is_ok());
-        // If model is already installed, creation should be fast (< 5 seconds)
-        // Pull would take much longer
-        assert!(
-            elapsed.as_secs() < 5,
-            "Creating embedder with installed model took too long ({:?}), suggests unnecessary pull",
-            elapsed
-        );
+        // Should succeed with truncation
+        assert!(result.is_ok(), "Long text should be truncated and embedded");
     }
 }

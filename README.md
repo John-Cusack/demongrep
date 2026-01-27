@@ -851,10 +851,12 @@ docker run -d --name ollama -p 11434:11434 ollama/ollama
 #### 2. Pull an embedding model
 
 ```bash
-ollama pull all-minilm          # 384 dims, default, fastest
-# or
-ollama pull nomic-embed-text    # 768 dims, better quality
-# or
+# Default: Jina Code (best for code search, 8k context, cross-compatible with FastEmbed)
+ollama pull unclemusclez/jina-embeddings-v2-base-code
+
+# Alternatives:
+ollama pull nomic-embed-text    # 768 dims, 2k context, general purpose
+ollama pull all-minilm          # 384 dims, fastest but short context (256 tokens)
 ollama pull mxbai-embed-large   # 1024 dims, highest quality
 ```
 
@@ -898,16 +900,22 @@ demongrep index --ollama-model mxbai-embed-large
 
 **Models are downloaded automatically!** When you specify a model, demongrep will pull it from Ollama if not already installed.
 
-| Model | Dimensions | FastEmbed Equivalent | Notes |
-|-------|------------|---------------------|-------|
-| `all-minilm` | 384 | `minilm-l6-q` | **Default** - fast, cross-compatible |
-| `nomic-embed-text` | 768 | `nomic-v1.5` | Better quality, cross-compatible |
-| `mxbai-embed-large` | 1024 | `mxbai-large` | Highest quality, cross-compatible |
-| `bge-large` | 1024 | `bge-large` | High quality, cross-compatible |
-| `bge-m3` | 1024 | — | Ollama only, multilingual |
-| `snowflake-arctic-embed` | 1024 | — | Ollama only |
+| Model | Dims | Context | FastEmbed Equivalent | Notes |
+|-------|------|---------|---------------------|-------|
+| `unclemusclez/jina-embeddings-v2-base-code` | 768 | 8192 tok | `jina-code` | **Default** - trained on code, long context |
+| `nomic-embed-text` | 768 | 2048 tok | `nomic-v1.5` | Good general purpose |
+| `all-minilm` | 384 | 256 tok | `minilm-l6-q` | Fastest, but very short context |
+| `mxbai-embed-large` | 1024 | 512 tok | `mxbai-large` | Highest quality |
+| `bge-large` | 1024 | 512 tok | `bge-large` | High quality |
+| `bge-m3` | 1024 | 8192 tok | — | Ollama only, multilingual |
+| `snowflake-arctic-embed` | 1024 | 512 tok | — | Ollama only |
 
-**Recommended:** Use `all-minilm` (default) for the best balance of speed and cross-backend compatibility.
+**Context Length Handling:**
+- Context length is automatically queried from Ollama at startup
+- Text exceeding the context is automatically truncated with retry logic
+- First attempt uses optimistic estimate (3 chars/token), retries with conservative (1.5 chars/token)
+
+**Recommended:** Use the default `jina-embeddings-v2-base-code` for best code search quality with 8k context.
 
 **Using a model:**
 

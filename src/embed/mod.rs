@@ -155,8 +155,14 @@ impl EmbeddingService {
     }
 
     /// Get model information
-    pub fn model_name(&self) -> &str {
-        self.model_type.name()
+    pub fn model_name(&self) -> String {
+        match self.backend {
+            EmbeddingBackend::FastEmbed => self.model_type.name().to_string(),
+            #[cfg(feature = "ollama")]
+            EmbeddingBackend::Ollama => {
+                self.cached_embedder.batch_embedder.model_name()
+            }
+        }
     }
 
     /// Get model type

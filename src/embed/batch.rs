@@ -176,7 +176,8 @@ impl EmbedderImpl {
 
 /// Batch processor for embedding chunks efficiently
 pub struct BatchEmbedder {
-    pub embedder: Arc<Mutex<FastEmbedder>>,
+    #[allow(dead_code)]
+    pub embedder: Option<Arc<Mutex<FastEmbedder>>>,
     embedder_impl: EmbedderImpl,
     token_budget: usize,
     provider: ExecutionProviderType,
@@ -199,7 +200,7 @@ impl BatchEmbedder {
         };
 
         Self {
-            embedder: embedder.clone(),
+            embedder: Some(embedder.clone()),
             embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget,
             provider,
@@ -218,7 +219,7 @@ impl BatchEmbedder {
         // So batch_size=32 → 32 * 500 / 4 = 4000 tokens
         let token_budget = batch_size * 125; // 500 chars / 4 chars per token
         Self {
-            embedder: embedder.clone(),
+            embedder: Some(embedder.clone()),
             embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget: token_budget.max(1000), // Minimum 1000 tokens
             provider,
@@ -233,7 +234,7 @@ impl BatchEmbedder {
             (e.provider(), e.dimensions())
         };
         Self {
-            embedder: embedder.clone(),
+            embedder: Some(embedder.clone()),
             embedder_impl: EmbedderImpl::FastEmbed(embedder),
             token_budget,
             provider,
@@ -246,20 +247,8 @@ impl BatchEmbedder {
     pub fn new_dyn(embedder: Arc<OllamaEmbedder>, model_dims: usize) -> Self {
         let token_budget = Self::calculate_token_budget(&ExecutionProviderType::Cpu, model_dims);
 
-        // Create a dummy FastEmbedder Arc for backwards compatibility
-        // This will only be used if someone accesses .embedder directly (legacy code)
-        // New code should use embedder_impl
-        let dummy_embedder = Arc::new(Mutex::new(
-            FastEmbedder::with_model_and_provider(
-                super::embedder::ModelType::default(),
-                ExecutionProviderType::Cpu,
-                None,
-            )
-            .expect("Failed to create placeholder embedder"),
-        ));
-
         Self {
-            embedder: dummy_embedder,
+            embedder: None,
             embedder_impl: EmbedderImpl::Ollama(embedder),
             token_budget,
             provider: ExecutionProviderType::Cpu,
@@ -276,18 +265,8 @@ impl BatchEmbedder {
     ) -> Self {
         let token_budget = batch_size * 125;
 
-        // Create a dummy FastEmbedder Arc for backwards compatibility
-        let dummy_embedder = Arc::new(Mutex::new(
-            FastEmbedder::with_model_and_provider(
-                super::embedder::ModelType::default(),
-                ExecutionProviderType::Cpu,
-                None,
-            )
-            .expect("Failed to create placeholder embedder"),
-        ));
-
         Self {
-            embedder: dummy_embedder,
+            embedder: None,
             embedder_impl: EmbedderImpl::Ollama(embedder),
             token_budget: token_budget.max(1000),
             provider: ExecutionProviderType::Cpu,
@@ -492,6 +471,11 @@ impl BatchEmbedder {
     /// Get embedder info (model name and dimensions)
     pub fn embedder_info(&self) -> (String, usize) {
         (self.embedder_impl.model_name(), self.embedder_impl.dimensions())
+    }
+
+    /// Get model name
+    pub fn model_name(&self) -> String {
+        self.embedder_impl.model_name()
     }
 
     /// Get model short name

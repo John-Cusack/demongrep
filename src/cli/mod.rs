@@ -53,7 +53,7 @@ pub struct Cli {
     pub backend: Option<String>,
 
     /// Ollama model name (when using ollama backend)
-    /// Examples: all-minilm (default), nomic-embed-text, mxbai-embed-large
+    /// Examples: unclemusclez/jina-embeddings-v2-base-code (default), nomic-embed-text, all-minilm
     #[arg(long, global = true)]
     pub ollama_model: Option<String>,
 }

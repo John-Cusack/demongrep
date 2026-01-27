@@ -94,7 +94,9 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             url: "http://localhost:11434".to_string(),
-            model: "all-minilm".to_string(),
+            // Jina code model: 768 dims, 8192 token context, trained on code
+            // Cross-compatible with FastEmbed's jina-code model
+            model: "unclemusclez/jina-embeddings-v2-base-code".to_string(),
             timeout: 30,
             parallelism: 8,
         }
@@ -201,7 +203,7 @@ mod tests {
         assert!(config.embedding.batch_size.is_none());
         assert_eq!(config.embedding.backend, "fastembed");
         assert_eq!(config.embedding.ollama.url, "http://localhost:11434");
-        assert_eq!(config.embedding.ollama.model, "all-minilm");
+        assert_eq!(config.embedding.ollama.model, "unclemusclez/jina-embeddings-v2-base-code");
     }
 
     #[test]
