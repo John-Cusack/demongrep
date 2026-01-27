@@ -7,12 +7,12 @@
 //! # Requirements
 //!
 //! - Ollama must be running (`ollama serve`)
-//! - An embedding model must be pulled (`ollama pull nomic-embed-text`)
+//! - An embedding model must be pulled (`ollama pull all-minilm`)
 //!
 //! # Example
 //!
 //! ```no_run
-//! use demongrep::embed::OllamaEmbedder;
+//! use demongrep::embed::{OllamaEmbedder, Embedder};
 //! use demongrep::config::OllamaConfig;
 //!
 //! let config = OllamaConfig::default();
@@ -98,22 +98,15 @@ impl OllamaEmbedder {
             .unwrap_or(false);
 
         if !model_exists {
-            // List available models for helpful error
-            let available: Vec<&str> = models["models"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| m["name"].as_str())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            anyhow::bail!(
-                "Model '{}' not found in Ollama. Install with: ollama pull {}\nAvailable models: {:?}",
-                config.model,
-                config.model,
-                available
+            // Model not found - try to pull it automatically
+            eprintln!(
+                "📥 Model '{}' not found locally. Pulling from Ollama library...",
+                config.model
             );
+
+            Self::pull_model(&agent, &config)?;
+
+            eprintln!("✅ Model '{}' pulled successfully!", config.model);
         }
 
         // Get dimensions (known or probe)
@@ -132,6 +125,98 @@ impl OllamaEmbedder {
             config,
             dimensions,
         })
+    }
+
+    /// Pull a model from the Ollama library
+    fn pull_model(agent: &ureq::Agent, config: &OllamaConfig) -> Result<()> {
+        use std::io::{BufRead, BufReader};
+
+        let url = format!("{}/api/pull", config.url);
+
+        // Use a longer timeout for pulling (models can be large)
+        let pull_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(600)) // 10 minute timeout for large models
+            .build();
+
+        let resp = pull_agent
+            .post(&url)
+            .send_json(serde_json::json!({
+                "name": config.model,
+                "stream": true
+            }))
+            .map_err(|e| anyhow::anyhow!("Failed to start model pull: {}", e))?;
+
+        // Read streaming response to show progress
+        let reader = BufReader::new(resp.into_reader());
+        let mut last_status = String::new();
+
+        for line in reader.lines() {
+            let line = line.context("Failed to read pull response")?;
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                // Check for error
+                if let Some(error) = json.get("error") {
+                    anyhow::bail!("Failed to pull model: {}", error);
+                }
+
+                // Show progress
+                if let Some(status) = json.get("status").and_then(|s| s.as_str()) {
+                    if status != last_status {
+                        if status.contains("pulling") {
+                            eprint!("\r   {} ", status);
+                        } else if status == "success" {
+                            eprintln!();
+                        } else {
+                            eprintln!("   {}", status);
+                        }
+                        last_status = status.to_string();
+                    }
+
+                    // Show download progress if available
+                    if let (Some(completed), Some(total)) = (
+                        json.get("completed").and_then(|v| v.as_u64()),
+                        json.get("total").and_then(|v| v.as_u64()),
+                    ) {
+                        if total > 0 {
+                            let pct = (completed as f64 / total as f64 * 100.0) as u32;
+                            let mb_done = completed / 1_000_000;
+                            let mb_total = total / 1_000_000;
+                            eprint!("\r   {} [{:>3}%] {}/{}MB", status, pct, mb_done, mb_total);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify the model was actually pulled by checking the list again
+        let health_url = format!("{}/api/tags", config.url);
+        let resp = agent.get(&health_url).call().context("Failed to verify model pull")?;
+        let models: serde_json::Value = resp.into_json().context("Failed to parse model list")?;
+
+        let model_exists = models["models"]
+            .as_array()
+            .map(|arr| {
+                arr.iter().any(|m| {
+                    m["name"]
+                        .as_str()
+                        .map(|n| n.starts_with(&config.model) || n == config.model)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if !model_exists {
+            anyhow::bail!(
+                "Model '{}' could not be pulled. It may not exist in the Ollama library.\n\
+                 Check available models at: https://ollama.ai/library",
+                config.model
+            );
+        }
+
+        Ok(())
     }
 
     /// Probe model dimensions by generating a test embedding
@@ -295,5 +380,103 @@ mod tests {
         for emb in embeddings {
             assert_eq!(emb.len(), embedder.dimensions());
         }
+    }
+
+    #[test]
+    #[ignore] // Requires running Ollama server - tests auto-pull
+    fn test_auto_pull_model() {
+        // Use a small model for testing auto-pull
+        // First, remove it if it exists (to test pulling)
+        let _ = std::process::Command::new("ollama")
+            .args(["rm", "all-minilm"])
+            .output();
+
+        // Now try to create embedder - should auto-pull
+        let config = OllamaConfig {
+            model: "all-minilm".to_string(),
+            ..Default::default()
+        };
+
+        let result = OllamaEmbedder::new(config);
+        assert!(result.is_ok(), "Auto-pull should succeed: {:?}", result.err());
+
+        let embedder = result.unwrap();
+        assert_eq!(embedder.dimensions(), 384);
+    }
+
+    #[test]
+    #[ignore] // Requires running Ollama server
+    fn test_auto_pull_invalid_model_fails() {
+        // Try to pull a model that doesn't exist
+        let config = OllamaConfig {
+            model: "this-model-does-not-exist-12345".to_string(),
+            ..Default::default()
+        };
+
+        let result = OllamaEmbedder::new(config);
+        assert!(result.is_err(), "Should fail for non-existent model");
+
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("could not be pulled") || err.contains("not exist"),
+            "Error should mention pull failure: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore] // Requires running Ollama server
+    fn test_auto_pull_then_embed() {
+        // Remove model first to ensure we test the full flow
+        let _ = std::process::Command::new("ollama")
+            .args(["rm", "all-minilm"])
+            .output();
+
+        let config = OllamaConfig {
+            model: "all-minilm".to_string(),
+            ..Default::default()
+        };
+
+        // Create embedder (should auto-pull)
+        let embedder = OllamaEmbedder::new(config).expect("Should auto-pull and create embedder");
+
+        // Now test embedding works
+        let embedding = embedder.embed_one("test embedding after auto-pull").unwrap();
+        assert_eq!(embedding.len(), 384);
+        assert!(embedding.iter().any(|&x| x != 0.0), "Embedding should have non-zero values");
+    }
+
+    #[test]
+    fn test_ollama_config_default() {
+        let config = OllamaConfig::default();
+        assert_eq!(config.url, "http://localhost:11434");
+        assert_eq!(config.model, "all-minilm");
+        assert_eq!(config.timeout, 30);
+        assert_eq!(config.parallelism, 8);
+    }
+
+    #[test]
+    #[ignore] // Requires running Ollama server
+    fn test_already_installed_model_no_pull() {
+        // First ensure model is installed
+        let _ = std::process::Command::new("ollama")
+            .args(["pull", "nomic-embed-text"])
+            .output();
+
+        let config = OllamaConfig::default();
+
+        // Should create without needing to pull
+        let start = std::time::Instant::now();
+        let result = OllamaEmbedder::new(config);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        // If model is already installed, creation should be fast (< 5 seconds)
+        // Pull would take much longer
+        assert!(
+            elapsed.as_secs() < 5,
+            "Creating embedder with installed model took too long ({:?}), suggests unnecessary pull",
+            elapsed
+        );
     }
 }

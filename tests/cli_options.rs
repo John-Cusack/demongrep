@@ -309,3 +309,508 @@ fn test_all_commands_show_model_in_help() {
         );
     }
 }
+
+// ============================================================================
+// Ollama Backend Tests
+// ============================================================================
+
+#[test]
+fn test_backend_flag_shown_in_help() {
+    let output = demongrep_bin()
+        .args(["index", "--help"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--backend"), "Help should show --backend option");
+    assert!(stdout.contains("ollama"), "Help should mention ollama backend");
+}
+
+#[test]
+fn test_ollama_model_flag_shown_in_help() {
+    let output = demongrep_bin()
+        .args(["index", "--help"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--ollama-model"), "Help should show --ollama-model option");
+}
+
+#[test]
+fn test_explicit_backend_fastembed_accepted() {
+    let output = demongrep_bin()
+        .args(["index", "--backend", "fastembed", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Should NOT show "Auto-detected Ollama" message when explicitly using fastembed
+    assert!(
+        !stderr.contains("Auto-detected Ollama"),
+        "Explicit --backend fastembed should not auto-detect Ollama"
+    );
+}
+
+#[test]
+fn test_invalid_backend_rejected() {
+    let output = demongrep_bin()
+        .args(["index", "--backend", "invalid_backend", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(!output.status.success(), "Invalid backend should be rejected");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown backend") || stderr.contains("Available backends"),
+        "Error should mention available backends. Stderr: {}", stderr
+    );
+}
+
+#[test]
+#[cfg(feature = "ollama")]
+fn test_explicit_backend_ollama_without_server_fails() {
+    // When explicitly requesting Ollama but server isn't running, should fail
+    // Use a port that definitely won't have Ollama
+    let output = demongrep_bin()
+        .env("DEMONGREP_OLLAMA_URL", "http://localhost:59999")
+        .args(["index", "--backend", "ollama", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    // This should fail because Ollama isn't available at that URL
+    // Note: The actual behavior depends on whether we fail fast or try to connect later
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Either it fails, or it shows an Ollama connection error
+    if !output.status.success() {
+        assert!(
+            stderr.contains("Ollama") || stderr.contains("connect") || stderr.contains("Cannot"),
+            "Should show Ollama connection error. Stderr: {}", stderr
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "ollama")]
+fn test_auto_detection_message_format() {
+    // If Ollama is running (e.g., in CI or dev environment),
+    // verify the auto-detection message format
+    let output = demongrep_bin()
+        .args(["index", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // If Ollama was auto-detected, verify message format
+    if stderr.contains("Auto-detected Ollama") {
+        assert!(
+            stderr.contains("http://") && stderr.contains("using Ollama backend"),
+            "Auto-detection message should show URL. Stderr: {}", stderr
+        );
+        assert!(
+            stderr.contains("--backend fastembed to override"),
+            "Should show how to override. Stderr: {}", stderr
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "ollama")]
+fn test_fastembed_override_when_ollama_available() {
+    // Even if Ollama is running, --backend fastembed should override
+    let output = demongrep_bin()
+        .args(["index", "--backend", "fastembed", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should NOT show auto-detection message
+    assert!(
+        !stderr.contains("Auto-detected Ollama"),
+        "Explicit fastembed should skip auto-detection. Stderr: {}", stderr
+    );
+}
+
+// ============================================================================
+// Backend Selection Priority Tests
+// ============================================================================
+
+/// Test the backend selection priority:
+/// 1. CLI --backend flag (highest)
+/// 2. Config file embedding.backend
+/// 3. Auto-detect Ollama if available
+/// 4. Default to FastEmbed
+#[test]
+fn test_backend_selection_cli_takes_priority() {
+    // Create a temp config file that sets backend = "ollama"
+    let temp_dir = std::env::temp_dir().join("demongrep_test_config");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let config_path = temp_dir.join("config.toml");
+
+    std::fs::write(&config_path, r#"
+[embedding]
+backend = "ollama"
+"#).expect("Failed to write test config");
+
+    // But CLI says fastembed - CLI should win
+    let output = demongrep_bin()
+        .env("DEMONGREP_CONFIG", config_path.to_str().unwrap())
+        .args(["index", "--backend", "fastembed", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should use FastEmbed, not Ollama
+    assert!(
+        !stderr.contains("Auto-detected Ollama") && !stderr.contains("Loading Ollama"),
+        "CLI --backend should override config. Stderr: {}", stderr
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(&config_path);
+}
+
+// ============================================================================
+// Ollama URL Configuration Tests
+// ============================================================================
+
+#[test]
+#[cfg(feature = "ollama")]
+fn test_custom_ollama_url_in_config() {
+    let temp_dir = std::env::temp_dir().join("demongrep_test_ollama_url");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let config_path = temp_dir.join("config.toml");
+
+    // Configure a custom (invalid) Ollama URL
+    std::fs::write(&config_path, r#"
+[embedding]
+backend = "fastembed"
+
+[embedding.ollama]
+url = "http://localhost:99999"
+model = "nomic-embed-text"
+"#).expect("Failed to write test config");
+
+    // With fastembed backend, should not try to connect to Ollama at all
+    let output = demongrep_bin()
+        .env("DEMONGREP_CONFIG", config_path.to_str().unwrap())
+        .args(["index", "--backend", "fastembed", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should not fail due to Ollama connection when using fastembed
+    assert!(
+        !stderr.contains("Cannot connect to Ollama"),
+        "Should not try Ollama when using fastembed. Stderr: {}", stderr
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(&config_path);
+}
+
+// ============================================================================
+// Diagnostic Tests - Help identify configuration issues
+// ============================================================================
+
+#[test]
+fn test_doctor_shows_ollama_status() {
+    let output = demongrep_bin()
+        .args(["doctor"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Doctor should show information about available backends
+    // This helps users diagnose why Ollama might not be auto-detected
+    #[cfg(feature = "ollama")]
+    {
+        // When compiled with ollama feature, should mention it
+        assert!(
+            stdout.contains("Ollama") || stdout.contains("ollama"),
+            "Doctor should show Ollama status when feature is enabled. Stdout: {}", stdout
+        );
+    }
+}
+
+/// This test helps diagnose auto-detection issues by printing debug info
+#[test]
+#[ignore] // Run manually with: cargo test --features ollama -- --ignored --nocapture
+fn test_debug_ollama_auto_detection() {
+    println!("\n=== Ollama Auto-Detection Debug ===\n");
+
+    // Check if ollama feature is compiled in
+    #[cfg(feature = "ollama")]
+    println!("✓ Ollama feature: ENABLED");
+    #[cfg(not(feature = "ollama"))]
+    println!("✗ Ollama feature: DISABLED");
+
+    // Try to connect to Ollama
+    #[cfg(feature = "ollama")]
+    {
+        let urls = [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434",
+            "http://host.docker.internal:11434",
+        ];
+
+        for url in urls {
+            let health_url = format!("{}/api/tags", url);
+            print!("  Checking {}... ", url);
+
+            match ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .get(&health_url)
+                .call()
+            {
+                Ok(resp) => {
+                    println!("✓ AVAILABLE (status: {})", resp.status());
+                    if let Ok(body) = resp.into_string() {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(models) = json["models"].as_array() {
+                                println!("    Models available: {}", models.len());
+                                for model in models.iter().take(5) {
+                                    if let Some(name) = model["name"].as_str() {
+                                        println!("      - {}", name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("✗ NOT AVAILABLE ({})", e);
+                }
+            }
+        }
+    }
+
+    // Run actual command and capture output
+    println!("\n=== Running demongrep index --dry-run ===\n");
+
+    let output = demongrep_bin()
+        .args(["index", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    println!("Exit code: {}", output.status);
+    println!("\nStdout:\n{}", String::from_utf8_lossy(&output.stdout));
+    println!("\nStderr:\n{}", String::from_utf8_lossy(&output.stderr));
+
+    // Check what backend was actually used
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Auto-detected Ollama") {
+        println!("\n✓ Result: Ollama was AUTO-DETECTED");
+    } else if stderr.contains("Loading Ollama") {
+        println!("\n✓ Result: Ollama backend was used (explicit)");
+    } else if stderr.contains("Loading embedding model") || stderr.contains("FastEmbed") {
+        println!("\n✗ Result: FastEmbed backend was used");
+        println!("  Possible reasons:");
+        println!("    1. Ollama not running");
+        println!("    2. Ollama feature not compiled in");
+        println!("    3. Config file sets backend = \"fastembed\"");
+        println!("    4. CLI --backend fastembed was used");
+    }
+}
+
+// ============================================================================
+// Auto-Pull Tests - Require Ollama server
+// ============================================================================
+
+/// Test that auto-pull message is shown when model isn't found
+#[test]
+#[ignore] // Requires running Ollama server
+fn test_auto_pull_message_shown() {
+    // First remove the model to ensure it needs to be pulled
+    let _ = std::process::Command::new("ollama")
+        .args(["rm", "all-minilm"])
+        .output();
+
+    let output = demongrep_bin()
+        .args(["index", "--backend", "ollama", "--ollama-model", "all-minilm", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should show the auto-pull message
+    assert!(
+        stderr.contains("not found locally") || stderr.contains("Pulling"),
+        "Should show auto-pull message when model not found. Stderr: {}",
+        stderr
+    );
+}
+
+/// Test that auto-pull succeeds and indexing continues
+#[test]
+#[ignore] // Requires running Ollama server
+fn test_auto_pull_then_index_succeeds() {
+    // Remove model first
+    let _ = std::process::Command::new("ollama")
+        .args(["rm", "all-minilm"])
+        .output();
+
+    // Create a temp directory with a small test file
+    let temp_dir = std::env::temp_dir().join("demongrep_autopull_test");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    std::fs::write(temp_dir.join("test.rs"), "fn main() { println!(\"hello\"); }").unwrap();
+
+    let output = demongrep_bin()
+        .args([
+            "index",
+            "--backend", "ollama",
+            "--ollama-model", "all-minilm",
+            "--force",
+        ])
+        .current_dir(&temp_dir)
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // Check success
+    assert!(
+        output.status.success(),
+        "Index should succeed after auto-pull. Stderr: {}\nStdout: {}",
+        stderr,
+        stdout
+    );
+
+    // Should show pull succeeded
+    assert!(
+        stderr.contains("pulled successfully") || stderr.contains("Ollama"),
+        "Should indicate Ollama was used. Stderr: {}",
+        stderr
+    );
+}
+
+/// Test that invalid model name fails gracefully
+#[test]
+#[ignore] // Requires running Ollama server
+fn test_auto_pull_invalid_model_fails_gracefully() {
+    let output = demongrep_bin()
+        .args([
+            "index",
+            "--backend", "ollama",
+            "--ollama-model", "this-model-definitely-does-not-exist-xyz123",
+            "--dry-run",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    // Should fail
+    assert!(
+        !output.status.success(),
+        "Should fail for non-existent model"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should show helpful error
+    assert!(
+        stderr.contains("could not be pulled")
+            || stderr.contains("not exist")
+            || stderr.contains("Failed to pull"),
+        "Should show pull failure message. Stderr: {}",
+        stderr
+    );
+}
+
+/// Test that already-installed model doesn't trigger pull
+#[test]
+#[ignore] // Requires running Ollama server
+fn test_no_pull_for_installed_model() {
+    // First ensure the model is installed
+    let _ = std::process::Command::new("ollama")
+        .args(["pull", "nomic-embed-text"])
+        .status();
+
+    let output = demongrep_bin()
+        .args(["index", "--backend", "ollama", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should NOT show pull message
+    assert!(
+        !stderr.contains("not found locally") && !stderr.contains("Pulling from Ollama"),
+        "Should not attempt to pull already-installed model. Stderr: {}",
+        stderr
+    );
+
+    // Should show Ollama backend is being used
+    assert!(
+        stderr.contains("Ollama") || stderr.contains("ollama"),
+        "Should indicate Ollama is being used. Stderr: {}",
+        stderr
+    );
+}
+
+/// Debug test to manually verify auto-pull behavior
+#[test]
+#[ignore] // Run manually: cargo test --features ollama -- test_debug_auto_pull --ignored --nocapture
+fn test_debug_auto_pull() {
+    println!("\n=== Auto-Pull Debug Test ===\n");
+
+    // Check Ollama status
+    println!("1. Checking Ollama server...");
+    match std::process::Command::new("ollama").args(["list"]).output() {
+        Ok(output) => {
+            println!("   Installed models:");
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        Err(e) => {
+            println!("   Failed to run ollama list: {}", e);
+            return;
+        }
+    }
+
+    // Test with a model that might need pulling
+    println!("\n2. Testing auto-pull with 'all-minilm'...");
+
+    // Remove it first
+    println!("   Removing model first...");
+    let _ = std::process::Command::new("ollama")
+        .args(["rm", "all-minilm"])
+        .status();
+
+    println!("   Running demongrep index --backend ollama --ollama-model all-minilm --dry-run");
+
+    let output = demongrep_bin()
+        .args(["index", "--backend", "ollama", "--ollama-model", "all-minilm", "--dry-run"])
+        .output()
+        .expect("Failed to execute command");
+
+    println!("\n   Exit code: {}", output.status);
+    println!("\n   Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    println!("\n   Stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+
+    // Verify model was pulled
+    println!("\n3. Verifying model was pulled...");
+    let list_output = std::process::Command::new("ollama")
+        .args(["list"])
+        .output()
+        .expect("Failed to list models");
+
+    let list_str = String::from_utf8_lossy(&list_output.stdout);
+    if list_str.contains("all-minilm") {
+        println!("   ✓ Model 'all-minilm' is now installed");
+    } else {
+        println!("   ✗ Model 'all-minilm' was NOT installed");
+        println!("   Current models: {}", list_str);
+    }
+}

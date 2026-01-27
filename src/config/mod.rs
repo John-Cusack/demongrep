@@ -14,7 +14,7 @@
 //!
 //! [embedding.ollama]
 //! url = "http://localhost:11434"
-//! model = "nomic-embed-text"
+//! model = "all-minilm"
 //! timeout = 30
 //! parallelism = 8
 //!
@@ -94,7 +94,7 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             url: "http://localhost:11434".to_string(),
-            model: "nomic-embed-text".to_string(),
+            model: "all-minilm".to_string(),
             timeout: 30,
             parallelism: 8,
         }
@@ -201,7 +201,7 @@ mod tests {
         assert!(config.embedding.batch_size.is_none());
         assert_eq!(config.embedding.backend, "fastembed");
         assert_eq!(config.embedding.ollama.url, "http://localhost:11434");
-        assert_eq!(config.embedding.ollama.model, "nomic-embed-text");
+        assert_eq!(config.embedding.ollama.model, "all-minilm");
     }
 
     #[test]

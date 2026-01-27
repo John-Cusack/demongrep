@@ -12,8 +12,8 @@ use crate::vectordb::SearchResult;
 
 pub use neural::NeuralReranker;
 
-/// Default RRF k parameter (k=20 for tighter ranking, k=60 for more recall)
-pub const DEFAULT_RRF_K: f32 = 20.0;
+/// Default RRF k parameter (research-recommended k=60 for balanced precision/recall)
+pub const DEFAULT_RRF_K: f32 = 60.0;
 
 /// Fused search result combining vector and FTS scores
 #[derive(Debug, Clone)]
