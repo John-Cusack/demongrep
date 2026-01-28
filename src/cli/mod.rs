@@ -3,7 +3,18 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::embed::{ExecutionProviderType, ModelType};
+use crate::embed::{EmbeddingBackend, ExecutionProviderType, ModelType};
+
+/// Check if Ollama is available at the given URL
+#[cfg(feature = "ollama")]
+fn is_ollama_available(url: &str) -> bool {
+    let health_url = format!("{}/api/tags", url);
+    // Quick check with short timeout
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    agent.get(&health_url).call().is_ok()
+}
 
 /// Fast, local semantic code search powered by Rust
 #[derive(Parser, Debug)]
@@ -35,6 +46,16 @@ pub struct Cli {
     /// Batch size for embedding (default determined by provider)
     #[arg(long, global = true)]
     pub batch_size: Option<usize>,
+
+    /// Embedding backend: fastembed (default) or ollama
+    /// Use ollama for GPU acceleration via Ollama server
+    #[arg(long, global = true)]
+    pub backend: Option<String>,
+
+    /// Ollama model name (when using ollama backend)
+    /// Examples: unclemusclez/jina-embeddings-v2-base-code (default), nomic-embed-text, all-minilm
+    #[arg(long, global = true)]
+    pub ollama_model: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -225,6 +246,47 @@ pub async fn run() -> Result<()> {
     // Merge batch_size: CLI > config
     let batch_size = cli.batch_size.or(config.embedding.batch_size);
 
+    // Merge backend: CLI > config > auto-detect
+    let backend = if let Some(ref backend_str) = cli.backend {
+        // Explicit CLI flag - use it
+        EmbeddingBackend::from_str(backend_str).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            eprintln!("Available backends: fastembed, ollama");
+            std::process::exit(1);
+        })
+    } else if config.embedding.backend != "fastembed" {
+        // Config file specifies a backend - use it
+        EmbeddingBackend::from_str(&config.embedding.backend).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            eprintln!("Available backends: fastembed, ollama");
+            std::process::exit(1);
+        })
+    } else {
+        // No explicit backend - auto-detect Ollama if available
+        #[cfg(feature = "ollama")]
+        {
+            if is_ollama_available(&config.embedding.ollama.url) {
+                eprintln!("📡 Auto-detected Ollama at {} - using Ollama backend", config.embedding.ollama.url);
+                eprintln!("   (Use --backend fastembed to override)");
+                EmbeddingBackend::Ollama
+            } else {
+                EmbeddingBackend::FastEmbed
+            }
+        }
+        #[cfg(not(feature = "ollama"))]
+        {
+            EmbeddingBackend::FastEmbed
+        }
+    };
+
+    // Create a mutable config clone for potential ollama model override
+    let mut config = config;
+
+    // Override ollama model if specified via CLI
+    if let Some(ollama_model) = &cli.ollama_model {
+        config.embedding.ollama.model = ollama_model.clone();
+    }
+
     // Helper to get provider string from command or config
     let get_provider_str = |cli_provider: &Option<String>| -> String {
         cli_provider.clone().unwrap_or_else(|| config.embedding.provider.clone())
@@ -332,6 +394,8 @@ pub async fn run() -> Result<()> {
                 provider_type,
                 Some(device_id),
                 batch_size,
+                backend,
+                &config,
             )
             .await
         }
@@ -342,9 +406,9 @@ pub async fn run() -> Result<()> {
             global,
             provider: _,
             device_id: _,
-        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), batch_size).await,
+        } => crate::index::index(path, dry_run, force, global, model_type, provider_type, Some(device_id), batch_size, backend, &config).await,
         Commands::Serve { port, path, provider: _, device_id: _ } => {
-            crate::server::serve(port, path, model_type, provider_type, Some(device_id), batch_size).await
+            crate::server::serve(port, path, model_type, provider_type, Some(device_id), batch_size, backend, &config).await
         }
         Commands::List => crate::index::list().await,
         Commands::Stats { path } => crate::index::stats(path).await,
@@ -352,7 +416,7 @@ pub async fn run() -> Result<()> {
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
         Commands::Mcp { path, provider: _, device_id: _ } => {
-            crate::mcp::run_mcp_server(path, provider_type, Some(device_id), batch_size).await
+            crate::mcp::run_mcp_server(path, provider_type, Some(device_id), batch_size, backend, &config).await
         }
     }
 }

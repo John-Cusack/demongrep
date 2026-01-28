@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::config::Config;
 use crate::database::DatabaseManager;  // NEW: Use DatabaseManager
-use crate::embed::{EmbeddingService, ExecutionProviderType};
+use crate::embed::{EmbeddingBackend, EmbeddingService, ExecutionProviderType};
 
 
 /// Demongrep MCP service with dual-database support via DatabaseManager
@@ -31,6 +32,9 @@ pub struct DemongrepService {
     provider: ExecutionProviderType,
     device_id: Option<i32>,
     batch_size: Option<usize>,
+    // Backend configuration
+    backend: EmbeddingBackend,
+    config: Config,
 }
 
 impl std::fmt::Debug for DemongrepService {
@@ -101,6 +105,8 @@ impl DemongrepService {
         provider: ExecutionProviderType,
         device_id: Option<i32>,
         batch_size: Option<usize>,
+        backend: EmbeddingBackend,
+        config: Config,
     ) -> Result<Self> {
         Ok(Self {
             tool_router: Self::tool_router(),
@@ -109,6 +115,8 @@ impl DemongrepService {
             provider,
             device_id,
             batch_size,
+            backend,
+            config,
         })
     }
 
@@ -116,8 +124,10 @@ impl DemongrepService {
     fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
         let mut guard = self.embedding_service.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(EmbeddingService::with_model_and_provider(
-                self.db_manager.model_type(),
+            *guard = Some(EmbeddingService::with_backend(
+                self.backend,
+                &self.config,
+                Some(self.db_manager.model_type()),
                 self.provider,
                 self.device_id,
                 self.batch_size,
@@ -329,6 +339,8 @@ pub async fn run_mcp_server(
     provider: ExecutionProviderType,
     device_id: Option<i32>,
     batch_size: Option<usize>,
+    backend: EmbeddingBackend,
+    config: &Config,
 ) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
@@ -345,7 +357,7 @@ pub async fn run_mcp_server(
     eprintln!("Starting demongrep MCP server...");
     eprintln!("Databases loaded:");
     for database in db_manager.databases() {
-        eprintln!("  {} {}", 
+        eprintln!("  {} {}",
             match database.db_type {
                 crate::database::DatabaseType::Local => "📍 Local: ",
                 crate::database::DatabaseType::Global => "🌍 Global:",
@@ -354,7 +366,7 @@ pub async fn run_mcp_server(
         );
     }
 
-    let service = DemongrepService::new(db_manager, provider, device_id, batch_size)?;
+    let service = DemongrepService::new(db_manager, provider, device_id, batch_size, backend, config.clone())?;
 
     // Serve using stdio transport
     let server = service.serve(stdio()).await?;

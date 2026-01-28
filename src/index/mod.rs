@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::chunker::SemanticChunker;
+use crate::config::Config;
 use crate::database::DatabaseManager;
-use crate::embed::{EmbeddingService, ExecutionProviderType, ModelType};
+use crate::embed::{EmbeddingBackend, EmbeddingService, ExecutionProviderType, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::vectordb::VectorStore;
@@ -200,7 +201,8 @@ fn remove_from_project_mapping(project_name: &str) -> Result<()> {
 }
 
 /// Index a repository
-pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bool, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bool, model: Option<ModelType>, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>, backend: EmbeddingBackend, config: &Config) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -276,6 +278,19 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     let db_path = get_index_db_path(Some(canonical_path.clone()), global)?;
     let model_type = model.unwrap_or_default();
 
+    // Determine dimensions based on backend
+    // For Ollama, get dimensions from known models or config
+    // For FastEmbed, use model_type dimensions
+    let dimensions = match backend {
+        #[cfg(feature = "ollama")]
+        EmbeddingBackend::Ollama => {
+            // Use known dimensions for common models, or probe Ollama
+            crate::embed::ollama_dimensions(&config.embedding.ollama.model)
+                .unwrap_or(768) // Default to 768 for unknown Ollama models
+        }
+        _ => model_type.dimensions(),
+    };
+
     println!("{}", "🚀 Demongrep Indexer".bright_cyan().bold());
     println!("{}", "=".repeat(60));
     println!("📂 Project: {}", project_path.display());
@@ -285,7 +300,17 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     } else {
         println!("📍 Mode: Local (project-specific)");
     }
-    println!("🧠 Model: {} ({} dims)", model_type.name(), model_type.dimensions());
+
+    // Show model info based on backend
+    match backend {
+        #[cfg(feature = "ollama")]
+        EmbeddingBackend::Ollama => {
+            println!("🧠 Model: {} ({} dims) [Ollama]", config.embedding.ollama.model, dimensions);
+        }
+        _ => {
+            println!("🧠 Model: {} ({} dims)", model_type.name(), model_type.dimensions());
+        }
+    }
 
     if dry_run {
         println!("\n{}", "🔍 DRY RUN MODE".bright_yellow());
@@ -324,16 +349,23 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
         return Ok(());
     }
 
-    // Open or create database
-    let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
+    // Open or create database with correct dimensions for the backend
+    let mut store = VectorStore::new(&db_path, dimensions)?;
     
     // Check database metadata for model changes
+    // Get the expected model name based on backend
+    let expected_model_name = match backend {
+        #[cfg(feature = "ollama")]
+        EmbeddingBackend::Ollama => config.embedding.ollama.model.clone(),
+        _ => model_type.name().to_string(),
+    };
+
     if is_incremental {
-        let db_meta = store.get_db_metadata(model_type.name(), model_type.dimensions())?;
-        if db_meta.model_name != model_type.name() || db_meta.dimensions != model_type.dimensions() {
+        let db_meta = store.get_db_metadata(&expected_model_name, dimensions)?;
+        if db_meta.model_name != expected_model_name || db_meta.dimensions != dimensions {
             println!("\n{}", "⚠️  Model changed! Full re-index required.".yellow());
             println!("   Old: {} ({} dims)", db_meta.model_name, db_meta.dimensions);
-            println!("   New: {} ({} dims)", model_type.name(), model_type.dimensions());
+            println!("   New: {} ({} dims)", expected_model_name, dimensions);
             println!("\n   Run {} first", "demongrep clear".bright_cyan());
             return Err(anyhow::anyhow!("Model mismatch - clear database first"));
         }
@@ -436,7 +468,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     let start = Instant::now();
     println!("🔄 Initializing embedding model...");
 
-    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
+    let mut embedding_service = EmbeddingService::with_backend(backend, config, Some(model_type), provider, device_id, batch_size)?;
     println!("✅ Model loaded: {} ({} dims)", embedding_service.model_name(), embedding_service.dimensions());
 
     let embedded_chunks = if all_chunks.is_empty() {
@@ -568,7 +600,7 @@ pub async fn index(path: Option<PathBuf>, dry_run: bool, force: bool, global: bo
     
     // Save database metadata
     store.save_db_metadata(
-        embedding_service.model_name(),
+        &embedding_service.model_name(),
         embedding_service.dimensions(),
         !is_incremental // mark_full_index only on first index
     )?;

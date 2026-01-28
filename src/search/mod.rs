@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::embed::{EmbeddingService, ModelType, ExecutionProviderType};
+use crate::config::Config;
+use crate::embed::{EmbeddingBackend, EmbeddingService, ModelType, ExecutionProviderType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::index::get_search_db_paths;
@@ -83,6 +84,8 @@ pub async fn search(
     provider: ExecutionProviderType,
     device_id: Option<i32>,
     batch_size: Option<usize>,
+    backend: EmbeddingBackend,
+    config: &Config,
 ) -> Result<()> {
     // Get all database paths (local + global)
     let db_paths = get_search_db_paths(path.clone())?;
@@ -114,22 +117,43 @@ pub async fn search(
     let mut model_load_duration = Duration::ZERO;
     
     // We'll use the first database's model/dimensions, or override
+    // For Ollama backend, dimensions come from the Ollama config/metadata
     let (model_type, dimensions) = if let Some(override_model) = model_override {
         (override_model, override_model.dimensions())
-    } else if let Some((model_name, dims)) = read_metadata(&db_paths[0]) {
-        if let Some(mt) = ModelType::from_str(&model_name) {
-            (mt, dims)
-        } else {
-            eprintln!("{}", "⚠️  Unknown model in metadata, using default".yellow());
-            (ModelType::default(), 384)
+    } else if let Some((_model_name, dims)) = read_metadata(&db_paths[0]) {
+        // When using Ollama backend, trust the metadata dimensions regardless of model name
+        match backend {
+            #[cfg(feature = "ollama")]
+            EmbeddingBackend::Ollama => {
+                // Use default model type placeholder, but actual dims from metadata
+                (ModelType::default(), dims)
+            }
+            _ => {
+                // For FastEmbed, try to match model name
+                if let Some(mt) = ModelType::from_str(&_model_name) {
+                    (mt, dims)
+                } else {
+                    eprintln!("{}", "⚠️  Unknown model in metadata, using default".yellow());
+                    (ModelType::default(), dims) // Still use dims from metadata!
+                }
+            }
         }
     } else {
-        (ModelType::default(), 384)
+        // No metadata - use defaults based on backend
+        match backend {
+            #[cfg(feature = "ollama")]
+            EmbeddingBackend::Ollama => {
+                let ollama_dims = crate::embed::ollama_dimensions(&config.embedding.ollama.model)
+                    .unwrap_or(768);
+                (ModelType::default(), ollama_dims)
+            }
+            _ => (ModelType::default(), 384)
+        }
     };
     
     // Initialize embedding service once (shared across all databases)
     let start = Instant::now();
-    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
+    let mut embedding_service = EmbeddingService::with_backend(backend, config, Some(model_type), provider, device_id, batch_size)?;
     model_load_duration = start.elapsed();
     
     // Embed query once
@@ -154,7 +178,7 @@ pub async fn search(
                 let db_type: &str = if db_path.ends_with(".demongrep.db") { "Local" } else { "Global" };
                 println!("{}", format!("🔄 Syncing {} database...", db_type).yellow());
             }
-            sync_database(&db_path, model_type, provider, device_id, batch_size)?;
+            sync_database(&db_path, model_type, provider, device_id, batch_size, backend, config)?;
         }
         
         // Load this database
@@ -390,7 +414,7 @@ pub async fn search(
 }
 
 /// Sync database by re-indexing changed files
-fn sync_database(db_path: &PathBuf, model_type: ModelType, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>) -> Result<()> {
+fn sync_database(db_path: &PathBuf, model_type: ModelType, provider: ExecutionProviderType, device_id: Option<i32>, batch_size: Option<usize>, backend: EmbeddingBackend, config: &Config) -> Result<()> {
     let project_path = db_path.parent().unwrap_or(std::path::Path::new("."));
 
     // Load file metadata store
@@ -401,7 +425,7 @@ fn sync_database(db_path: &PathBuf, model_type: ModelType, provider: ExecutionPr
     let (files, _stats) = walker.walk()?;
 
     // Initialize services
-    let mut embedding_service = EmbeddingService::with_model_and_provider(model_type, provider, device_id, batch_size)?;
+    let mut embedding_service = EmbeddingService::with_backend(backend, config, Some(model_type), provider, device_id, batch_size)?;
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut store = VectorStore::new(db_path, model_type.dimensions())?;
 

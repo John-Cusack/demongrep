@@ -13,7 +13,7 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Context Windows** — Shows surrounding code (3 lines before/after) for better understanding
 - **Local & Private** — All processing happens locally using ONNX models, no data leaves your machine
 - **Fast** — Sub-second search after initial model load, incremental indexing
-- **GPU Acceleration** — Optional CUDA, TensorRT, CoreML, and DirectML support for faster indexing
+- **GPU Acceleration** — Optional CUDA, TensorRT, DirectML, and **Ollama** (recommended) support for faster indexing
 - **Multiple Interfaces** — CLI, HTTP server, and MCP server for Claude Code integration
 
 ---
@@ -39,6 +39,8 @@ Search your codebase using natural language queries like *"where do we handle au
 - [Database Management](#database-management)
 - [Supported Languages](#supported-languages)
 - [Embedding Models](#embedding-models)
+- [GPU Acceleration](#gpu-acceleration)
+- [Ollama Backend](#ollama-backend-recommended-for-gpu)
 - [Configuration](#configuration)
 - [How It Works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
@@ -670,29 +672,38 @@ These languages are indexed with fallback line-based chunking:
 
 ### Available Models
 
-| Name | ID | Dimensions | Speed | Quality | Best For |
-|------|-----|------------|-------|---------|----------|
-| MiniLM-L6 | `minilm-l6` | 384 | Fastest | Excellent | General use |
-| MiniLM-L6 (Q) | `minilm-l6-q` | 384 | Fastest | Excellent | **Default** |
-| MiniLM-L12 | `minilm-l12` | 384 | Fast | Better | Higher quality |
-| MiniLM-L12 (Q) | `minilm-l12-q` | 384 | Fast | Better | Higher quality |
-| BGE Small | `bge-small` | 384 | Fast | Good | General use |
-| BGE Small (Q) | `bge-small-q` | 384 | Fast | Good | General use |
-| BGE Base | `bge-base` | 768 | Medium | Better | Higher quality |
-| BGE Large | `bge-large` | 1024 | Slow | Best | Highest quality |
-| Jina Code | `jina-code` | 768 | Medium | Excellent | **Code-specific** |
-| Nomic v1.5 | `nomic-v1.5` | 768 | Medium | Good | Long context |
-| E5 Multilingual | `e5-multilingual` | 384 | Fast | Good | Non-English code |
-| MxBai Large | `mxbai-large` | 1024 | Slow | Excellent | High quality |
+Models marked with ✅ in both columns can be used interchangeably between FastEmbed and Ollama backends.
+
+| Name | FastEmbed ID | Ollama ID | Dims | Notes |
+|------|--------------|-----------|------|-------|
+| **All-MiniLM-L6** | `minilm-l6-q` | `all-minilm` | 384 | **Default** - Fast, works on both backends |
+| MiniLM-L6 | `minilm-l6` | `all-minilm` | 384 | Non-quantized version |
+| MiniLM-L12 | `minilm-l12-q` | — | 384 | Higher quality, FastEmbed only |
+| BGE Small | `bge-small-q` | — | 384 | FastEmbed only |
+| **Nomic Embed** | `nomic-v1.5` | `nomic-embed-text` | 768 | Works on both, good quality |
+| BGE Base | `bge-base` | — | 768 | FastEmbed only |
+| Jina Code | `jina-code` | — | 768 | Code-optimized, FastEmbed only |
+| **MxBai Large** | `mxbai-large` | `mxbai-embed-large` | 1024 | Works on both, highest quality |
+| **BGE Large** | `bge-large` | `bge-large` | 1024 | Works on both |
+| BGE-M3 | — | `bge-m3` | 1024 | Ollama only, multilingual |
+| E5 Multilingual | `e5-multilingual` | — | 384 | FastEmbed only, multilingual |
+
+**Recommended models (work on both backends):**
+- `all-minilm` / `minilm-l6-q` (384d) — **Default**, fastest, good for most codebases
+- `nomic-embed-text` / `nomic-v1.5` (768d) — Better quality, long context
+- `mxbai-embed-large` / `mxbai-large` (1024d) — Highest quality, slower
 
 ### Changing Models
 
 ```bash
-# Index with specific model
-demongrep index --model jina-code
+# FastEmbed backend
+demongrep index --model minilm-l6-q
 
-# Search must use same model as index
-demongrep search "query" --model jina-code
+# Ollama backend
+demongrep index --backend ollama --ollama-model all-minilm
+
+# Search must use same model/backend as index
+demongrep search "query"
 ```
 
 **Note:** The model used for indexing is saved in metadata. If you search with a different model, you may get poor results. Use `--force` to re-index with a new model.
@@ -705,28 +716,34 @@ demongrep supports GPU acceleration for faster embedding generation during index
 
 ### Supported Providers
 
-| Provider | Platform | Flag | Build Feature |
-|----------|----------|------|---------------|
-| CPU | All (Linux, macOS, Windows*) | `--provider cpu` | (default) |
-| CUDA | Linux/Windows* + NVIDIA GPU | `--provider cuda` | `--features gpu-nvidia` |
-| TensorRT | Linux/Windows* + NVIDIA GPU | `--provider tensorrt` | `--features tensorrt` |
-| CoreML | macOS (Intel & Apple Silicon) | `--provider coreml` | `--features gpu-apple` |
-| DirectML | Windows* (DirectX 12 GPU) | `--provider directml` | `--features gpu-windows` |
+| Provider | Platform | Flag | Build Feature | Recommended |
+|----------|----------|------|---------------|-------------|
+| **Ollama** | All (with Ollama installed) | `--backend ollama` | `--features ollama` | ✅ **Best option** |
+| CPU | All (Linux, macOS, Windows*) | `--provider cpu` | (default) | ✅ Good fallback |
+| CUDA | Linux/Windows* + NVIDIA GPU | `--provider cuda` | `--features gpu-nvidia` | ⚠️ Modest gains |
+| TensorRT | Linux/Windows* + NVIDIA GPU | `--provider tensorrt` | `--features tensorrt` | ⚠️ Complex setup |
+| CoreML | macOS (Intel & Apple Silicon) | `--provider coreml` | `--features gpu-apple` | ❌ **Not recommended** |
+| DirectML | Windows* (DirectX 12 GPU) | `--provider directml` | `--features gpu-windows` | ❓ Untested |
 
 *Windows support has not been tested.
+
+**⚠️ CoreML Warning:** Apple's CoreML is optimized for CNNs (image models), not transformer-based embedding models. Many transformer operations fall back to CPU, making CoreML often **slower than pure CPU**. Use Ollama instead on macOS - it uses Metal directly with optimized shaders and is ~10x faster.
 
 ### Building with GPU Support
 
 #### Quick Reference
 
-| Platform | Build Command |
-|----------|---------------|
-| CPU only (all platforms) | `cargo build --release` |
-| macOS (Apple Silicon/Intel) | `cargo build --release --features gpu-apple` |
-| Linux/Windows (NVIDIA GPU) | `cargo build --release --features gpu-nvidia` |
-| Windows (DirectX 12 GPU)* | `cargo build --release --features gpu-windows` |
+| Platform | Build Command | Notes |
+|----------|---------------|-------|
+| **All platforms (recommended)** | `cargo build --release --features ollama` | Use Ollama for GPU |
+| macOS | `cargo build --release --features gpu-apple` | Includes Ollama (CoreML not recommended) |
+| Linux (NVIDIA GPU) | `cargo build --release --features "gpu-nvidia,ollama"` | Ollama + CUDA fallback |
+| CPU only (all platforms) | `cargo build --release` | Basic, no GPU |
+| Windows (DirectX 12)* | `cargo build --release --features gpu-windows` | Untested |
 
 *Windows support has not been tested.
+
+**Recommendation:** Build with `--features ollama` and install [Ollama](https://ollama.ai) for the best GPU acceleration on all platforms.
 
 #### Detailed Build Instructions
 
@@ -738,12 +755,13 @@ This works on Linux, macOS (Intel & Apple Silicon), and Windows. No GPU features
 
 **macOS (Intel & Apple Silicon):**
 ```bash
-# CoreML support - uses Apple's ML framework (built into macOS)
-# Apple Silicon: Uses Neural Engine + GPU for acceleration
-# Intel Mac: Uses CPU/GPU, still faster than pure CPU provider
+# Recommended: Ollama support (uses Metal GPU via Ollama)
+cargo build --release --features ollama
+
+# Alternative: includes Ollama + CoreML (CoreML not recommended)
 cargo build --release --features gpu-apple
 ```
-No additional dependencies beyond the Homebrew prerequisites. CoreML is built into macOS 10.13+.
+**Note:** On macOS, always use Ollama for GPU acceleration. CoreML is not optimized for transformers and is often slower than CPU. The `gpu-apple` feature includes CoreML as a fallback, but Ollama with Metal is ~10x faster.
 
 **Linux/Windows with NVIDIA GPU:**
 ```bash
@@ -787,10 +805,191 @@ This results in ~30% faster indexing compared to fixed batch sizes.
 
 ### Performance Tips
 
-1. **NVIDIA GPUs**: Use `--provider cuda` — typically 1.5-2x faster than CPU for large codebases
-2. **macOS**: Use `--provider coreml` — Apple Silicon gets Neural Engine acceleration, Intel Macs see modest gains
-3. **Check GPU memory**: Use `nvidia-smi` (NVIDIA) or Activity Monitor (macOS) — model uses ~500MB
-4. **Tune token budget**: Set `DEMONGREP_TOKEN_BUDGET` environment variable if needed
+1. **All platforms**: Install [Ollama](https://ollama.ai) and build with `--features ollama` — **~10x faster** than other options
+2. **macOS**: **Use Ollama, NOT CoreML** — CoreML is optimized for CNNs, not transformers, and is often slower than CPU
+3. **NVIDIA GPUs**: Ollama is still faster than CUDA/TensorRT for embeddings; use `--provider cuda` only as fallback
+4. **Check GPU memory**: Use `nvidia-smi` (NVIDIA) or Activity Monitor (macOS) — model uses ~500MB
+5. **Tune token budget**: Set `DEMONGREP_TOKEN_BUDGET` environment variable if needed
+
+---
+
+## Ollama Backend (Recommended for GPU)
+
+demongrep supports [Ollama](https://ollama.ai) as an alternative embedding backend. **This is the recommended approach for GPU acceleration** as it provides significantly better performance than ONNX Runtime.
+
+### Why Ollama?
+
+| Backend | nomic-embed-text (768d) | Notes |
+|---------|-------------------------|-------|
+| FastEmbed CPU | 5.6 chunks/sec | Slow for large models |
+| FastEmbed CUDA | 6.8 chunks/sec | Minimal GPU benefit |
+| Ollama CPU | 2.4 chunks/sec | Model stays warm |
+| **Ollama GPU** | **52.2 chunks/sec** | **~10x faster than FastEmbed** |
+
+With the same model, Ollama with GPU is **~10x faster for indexing** and **~3x faster for search**.
+
+**Why not CoreML?** Apple's CoreML is optimized for CNNs (image models), not transformer-based embedding models. Many transformer operations fall back to CPU, and data transfer overhead can make it slower than pure CPU. Ollama uses Metal directly with hand-optimized shaders for transformers, which is why it's much faster on Mac.
+
+### Setup
+
+#### 1. Install Ollama
+
+**macOS/Linux:**
+```bash
+curl -fsSL https://ollama.ai/install.sh | sh
+```
+
+**Or with Docker (recommended for servers):**
+```bash
+# With GPU support (NVIDIA)
+docker run -d --gpus all --name ollama -p 11434:11434 ollama/ollama
+
+# CPU only
+docker run -d --name ollama -p 11434:11434 ollama/ollama
+```
+
+#### 2. Pull an embedding model
+
+```bash
+# Default: Jina Code (best for code search, 8k context, cross-compatible with FastEmbed)
+ollama pull unclemusclez/jina-embeddings-v2-base-code
+
+# Alternatives:
+ollama pull nomic-embed-text    # 768 dims, 2k context, general purpose
+ollama pull all-minilm          # 384 dims, fastest but short context (256 tokens)
+ollama pull mxbai-embed-large   # 1024 dims, highest quality
+```
+
+#### 3. Build demongrep with Ollama support
+
+```bash
+# macOS (gpu-apple already includes ollama)
+cargo build --release --features gpu-apple
+
+# Linux/Windows
+cargo build --release --features ollama
+```
+
+#### 4. Index and search
+
+**Ollama is auto-detected!** When built with `--features ollama` and Ollama is running, demongrep automatically uses it:
+
+```bash
+# Auto-detects Ollama if running
+demongrep index
+
+# Output:
+# 📡 Auto-detected Ollama at http://localhost:11434 - using Ollama backend
+#    (Use --backend fastembed to override)
+```
+
+You can also be explicit:
+
+```bash
+# Explicitly use Ollama backend
+demongrep index --backend ollama
+
+# Force FastEmbed even if Ollama is running
+demongrep index --backend fastembed
+
+# Use a different Ollama model
+demongrep index --ollama-model mxbai-embed-large
+```
+
+### Available Ollama Embedding Models
+
+**Models are downloaded automatically!** When you specify a model, demongrep will pull it from Ollama if not already installed.
+
+| Model | Dims | Context | FastEmbed Equivalent | Notes |
+|-------|------|---------|---------------------|-------|
+| `unclemusclez/jina-embeddings-v2-base-code` | 768 | 8192 tok | `jina-code` | **Default** - trained on code, long context |
+| `nomic-embed-text` | 768 | 2048 tok | `nomic-v1.5` | Good general purpose |
+| `all-minilm` | 384 | 256 tok | `minilm-l6-q` | Fastest, but very short context |
+| `mxbai-embed-large` | 1024 | 512 tok | `mxbai-large` | Highest quality |
+| `bge-large` | 1024 | 512 tok | `bge-large` | High quality |
+| `bge-m3` | 1024 | 8192 tok | — | Ollama only, multilingual |
+| `snowflake-arctic-embed` | 1024 | 512 tok | — | Ollama only |
+
+**Context Length Handling:**
+- Context length is automatically queried from Ollama at startup
+- Text exceeding the context is automatically truncated with retry logic
+- First attempt uses optimistic estimate (3 chars/token), retries with conservative (1.5 chars/token)
+
+**Recommended:** Use the default `jina-embeddings-v2-base-code` for best code search quality with 8k context.
+
+**Using a model:**
+
+```bash
+# Just specify it - demongrep will auto-pull if needed
+demongrep index --ollama-model all-minilm
+
+# Or manually pull first
+ollama pull all-minilm
+
+# Set default in config (~/.demongrep/config.toml)
+[embedding.ollama]
+model = "all-minilm"
+```
+
+**Check available models:**
+
+```bash
+# List models installed in Ollama
+ollama list
+
+# Check demongrep configuration
+demongrep doctor
+```
+
+### Configuration
+
+Add to `~/.demongrep/config.toml`:
+
+```toml
+[embedding]
+backend = "ollama"  # Use Ollama by default
+
+[embedding.ollama]
+url = "http://localhost:11434"  # Ollama server URL
+model = "all-minilm"             # Embedding model (384d, cross-compatible)
+timeout = 30                     # Request timeout (seconds)
+parallelism = 8                  # Parallel HTTP requests
+```
+
+### Performance Comparison
+
+Benchmarked on RTX A2000 8GB with 1394 code chunks:
+
+| Metric | FastEmbed (CPU) | Ollama (GPU) | Speedup |
+|--------|-----------------|--------------|---------|
+| Indexing | 5.6 c/s | 52.2 c/s | **9.3x** |
+| Search | 1.27s | 0.43s | **3.0x** |
+| Index 1394 chunks | 264s | 27s | **9.8x** |
+
+### Troubleshooting
+
+**"Cannot connect to Ollama"**
+```bash
+# Check Ollama is running
+curl http://localhost:11434/api/tags
+
+# Start Ollama
+ollama serve
+# or
+docker start ollama
+```
+
+**"Model not found"**
+```bash
+# Pull the model first
+ollama pull nomic-embed-text
+```
+
+**Dimension mismatch error**
+```bash
+# Re-index with --force when switching backends/models
+demongrep index --backend ollama --force
+```
 
 ---
 
