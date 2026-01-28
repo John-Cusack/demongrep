@@ -95,6 +95,9 @@ schemars = { version = "1.1.0", features = ["derive"] }
 # Ollama support (optional) - uses ureq for simple blocking HTTP without async runtime conflicts
 ureq = { version = "2.9", features = ["json"], optional = true }
 
+# USearch for benchmarking (optional)
+usearch = { version = "2.23.0", optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.13"
@@ -106,6 +109,14 @@ harness = false
 
 [[bench]]
 name = "batch_size_optimization"
+harness = false
+
+[[bench]]
+name = "hnsw_comparison"
+harness = false
+
+[[bench]]
+name = "usearch_benchmark"
 harness = false
 
 [profile.release]
@@ -128,6 +139,9 @@ directml = ["ort/directml"]
 
 # Ollama embedding backend
 ollama = ["ureq"]
+
+# usearch benchmark (optional)
+usearch = ["dep:usearch"]
 
 # Convenience aliases
 gpu-nvidia = ["cuda"]
